@@ -24,7 +24,7 @@ use crate::{
 /// # Example
 ///
 /// ```
-/// use relaxng_conform::{
+/// use relax_ng::{
 ///     Content, DatatypeRegistry, Element, ExpandedName, ResolveError, Schema, SchemaResolver,
 ///     SchemaSource, SchemaSyntax,
 /// };

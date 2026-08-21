@@ -13,7 +13,7 @@ pattern matching, datatypes).
 ## Usage
 
 ```rust
-use relaxng_conform::{
+use relax_ng::{
     Content, DatatypeRegistry, Element, ExpandedName, ResolveError, Schema, SchemaResolver,
     SchemaSource, SchemaSyntax,
 };
@@ -111,12 +111,10 @@ no code taken from it — published under MIT from the start.
 
 ## Package name and versioning
 
-Intended crates.io name: `relaxng-conform` (matches `html-conform`'s
-naming — domain + purpose, same vocabulary). Not yet published; the
-current `0.1.0` in `Cargo.toml` is a pre-release working version, not a
-semver commitment — breaking changes to the public API are still expected
-before the first published/`1.0` release. Once published, this crate
-follows normal semver.
+Published on crates.io as `relax-ng`. The current `0.1.0` in `Cargo.toml`
+is a pre-release working version, not a semver commitment — breaking
+changes to the public API are still expected before a `1.0` release.
+After that, this crate follows normal semver.
 
 ## License
 

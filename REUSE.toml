@@ -1,5 +1,5 @@
 version = 1
-SPDX-PackageName = "relaxng-conform"
+SPDX-PackageName = "relax-ng"
 SPDX-PackageSupplier = "CASOON"
 SPDX-PackageDownloadLocation = "https://github.com/casoon/relax-ng"
 

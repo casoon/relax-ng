@@ -21,7 +21,7 @@ human-readable summary. License texts referenced below are in
 
 The vendored files are used unmodified, solely to drive this crate's own
 tests against the official RELAX NG conformance suite — they are not
-distributed as part of the published `relaxng-conform` crate.
+distributed as part of the published `relax-ng` crate.
 
 ## Cargo dependencies
 

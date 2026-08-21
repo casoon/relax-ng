@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
 
-use relaxng_conform::{
+use relax_ng::{
     Content, DatatypeRegistry, Element, ExpandedName, ResolveError, SchemaResolver, SchemaSource,
     SchemaSyntax, parse, simplify, validate,
 };

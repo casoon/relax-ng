@@ -9,7 +9,7 @@
 //! purely to keep this example self-contained (no XML-parser
 //! dev-dependency needed just to demonstrate the API).
 
-use relaxng_conform::{
+use relax_ng::{
     Content, DatatypeRegistry, Element, ExpandedName, ResolveError, Schema, SchemaResolver,
     SchemaSource, SchemaSyntax,
 };

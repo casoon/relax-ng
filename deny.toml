@@ -1,0 +1,25 @@
+# cargo-deny configuration — see `plan/09-licensing-compliance.md`.
+#
+# Deliberately scoped to the license check the phase plan actually asks
+# for (`cargo deny check licenses`); the `[advisories]`/`[bans]`/`[sources]`
+# sections aren't configured here and fall back to cargo-deny's defaults.
+
+[licenses]
+version = 2
+# Every SPDX identifier that may appear, alone or as part of an AND/OR
+# expression, in a dependency's declared license — each with a reason, per
+# `plan/09-licensing-compliance.md`'s "begründete Ausnahme pro
+# Abhängigkeit" requirement.
+allow = [
+    "MIT",             # this crate's own license; also used (alone or via
+                        # "OR") by every current dependency.
+    "Apache-2.0",       # the other half of the "MIT OR Apache-2.0" dual
+                        # license the regex/roxmltree family uses.
+    "Unlicense",        # aho-corasick/memchr's "Unlicense OR MIT" — public-
+                        # domain-equivalent, strictly more permissive than MIT.
+    "Unicode-3.0",      # unicode-ident bundles Unicode's own char-property
+                        # tables under Unicode's own (permissive) license —
+                        # required alongside MIT/Apache-2.0 for that crate,
+                        # not a substitute for them.
+]
+confidence-threshold = 0.8

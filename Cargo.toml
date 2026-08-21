@@ -1,0 +1,15 @@
+[package]
+name = "relaxng-conform"
+version = "0.1.0"
+edition = "2024"
+description = "A pure-Rust RELAX NG schema parser and validator"
+license = "MIT"
+repository = "https://github.com/casoon/relax-ng"
+
+[dependencies]
+regex = "1"
+roxmltree = "0.21.1"
+unicode-ident = "1"
+
+[dev-dependencies]
+roxmltree = "0.21.1"

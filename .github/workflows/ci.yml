@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo build
+      - run: cargo test
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: (cd tests/corpus/relaxng && shasum -a 256 --check spectest.xml.sha256)
+      - run: test "$(python3 xtask/spectest_inventory.py | tail -n 1)" = "385 test cases in the vendored suite"
+      - uses: fsfe/reuse-action@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses

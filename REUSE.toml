@@ -1,0 +1,13 @@
+version = 1
+SPDX-PackageName = "relaxng-conform"
+SPDX-PackageSupplier = "CASOON"
+SPDX-PackageDownloadLocation = "https://github.com/casoon/relax-ng"
+
+# This crate's own files. The vendored RELAX NG test suite under
+# tests/corpus/relaxng/ (spectest.xml, copying.txt) keeps its own
+# BSD-3-Clause .license sidecars, which take precedence over this bulk
+# rule — see tests/corpus/relaxng/UPSTREAM.md for its provenance.
+[[annotations]]
+path = ["**"]
+SPDX-FileCopyrightText = "2026 CASOON"
+SPDX-License-Identifier = "MIT"

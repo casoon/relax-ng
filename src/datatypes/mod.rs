@@ -13,3 +13,11 @@ mod xsd;
 
 pub use registry::XSD_DATATYPE_LIBRARY;
 pub use registry::{DatatypeContext, DatatypeError, DatatypeLibrary, DatatypeRegistry};
+
+/// Whitespace-collapse: replace every run of whitespace with a single
+/// space and trim the ends. Shared by the built-in library's `token`
+/// (§5.2) and the XSD library's `NCName`/`Name`/`NMTOKEN`/... family and
+/// `base64Binary` facet (Part 2's `collapse` `whiteSpace` facet).
+pub(super) fn collapse_whitespace(value: &str) -> String {
+    value.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+}

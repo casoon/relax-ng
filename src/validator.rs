@@ -430,6 +430,18 @@ fn check_datatypes_supported(
     }
 }
 
+/// Looks up a `ref`'s target definition — every `deriv_*`/`nullable`-family
+/// function below follows `ref` transparently and unconditionally, which is
+/// safe (never infinitely recurses) only because RELAX NG §4.19 is checked
+/// at schema-compile time, before any document is ever validated, and
+/// guarantees both that `name` exists and that no such chain of `ref`s can
+/// reach itself again without first crossing an `element`.
+fn resolve_ref<'a>(name: &str, definitions: &'a Definitions) -> &'a Pattern {
+    definitions
+        .get(name)
+        .expect("RELAX NG §4.18 guarantees every ref target exists")
+}
+
 /// Whether `pattern` accepts having nothing more follow — i.e. whether the
 /// content/attributes/text matched *so far* (already folded into
 /// `pattern` via the various `deriv_*` functions below) are already
@@ -505,13 +517,7 @@ pub(crate) fn nullable(
             .iter()
             .all(|value| nullable(value, definitions, registry)),
         Pattern::OneOrMore(values) => nullable(&values[0], definitions, registry),
-        Pattern::Ref(name) => nullable(
-            definitions
-                .get(name)
-                .expect("RELAX NG §4.18 guarantees every ref target exists"),
-            definitions,
-            registry,
-        ),
+        Pattern::Ref(name) => nullable(resolve_ref(name, definitions), definitions, registry),
         Pattern::Optional(_)
         | Pattern::ZeroOrMore(_)
         | Pattern::Mixed(_)
@@ -610,12 +616,7 @@ fn structurally_nullable(pattern: &Pattern, definitions: &Definitions) -> bool {
             .iter()
             .all(|value| structurally_nullable(value, definitions)),
         Pattern::OneOrMore(values) => structurally_nullable(&values[0], definitions),
-        Pattern::Ref(name) => structurally_nullable(
-            definitions
-                .get(name)
-                .expect("RELAX NG §4.18 guarantees every ref target exists"),
-            definitions,
-        ),
+        Pattern::Ref(name) => structurally_nullable(resolve_ref(name, definitions), definitions),
         Pattern::Optional(_)
         | Pattern::ZeroOrMore(_)
         | Pattern::Mixed(_)
@@ -663,12 +664,7 @@ fn wants_text(pattern: &Pattern, definitions: &Definitions) -> bool {
             found
         }
         Pattern::OneOrMore(values) => wants_text(&values[0], definitions),
-        Pattern::Ref(name) => wants_text(
-            definitions
-                .get(name)
-                .expect("RELAX NG §4.18 guarantees every ref target exists"),
-            definitions,
-        ),
+        Pattern::Ref(name) => wants_text(resolve_ref(name, definitions), definitions),
         Pattern::Optional(_)
         | Pattern::ZeroOrMore(_)
         | Pattern::Mixed(_)
@@ -712,14 +708,48 @@ fn close_child_position(pattern: &Pattern, definitions: &Definitions) -> Pattern
                 .collect(),
         ),
         Pattern::OneOrMore(values) => close_child_position(&values[0], definitions),
-        Pattern::Ref(name) => close_child_position(
-            definitions
-                .get(name)
-                .expect("RELAX NG §4.18 guarantees every ref target exists"),
-            definitions,
-        ),
+        Pattern::Ref(name) => close_child_position(resolve_ref(name, definitions), definitions),
         _ => Pattern::Empty,
     }
+}
+
+/// A `Choice`'s derivative: every operand derived independently, discarding
+/// (via [`choice`]) whichever branches turned `notAllowed` — shared by
+/// [`deriv_attribute`]/[`deriv_element_event`]/[`deriv_text`], which only
+/// differ in what `deriv_one` does.
+fn deriv_choice(values: &[Pattern], deriv_one: impl Fn(&Pattern) -> Pattern) -> Pattern {
+    choice(values.iter().map(deriv_one).collect())
+}
+
+/// The derivative structural step shared by every `deriv_*` function below:
+/// `group`/`interleave`/`choice`/`oneOrMore`/`ref` all recurse exactly the
+/// same way no matter which kind of event (`attribute`/element/text) is
+/// being derived — only `deriv_one` (what to do with one operand/the `ref`
+/// target) and, for `group`, `sequential` (see [`deriv_positions`]) differ
+/// per event kind. `interleave` is always non-sequential regardless of
+/// event kind — unlike `group`'s child-content ordering, attributes have no
+/// order in XML at all, and neither does `interleave`'s own definition.
+/// Returns `None` for every other pattern — its own matching leaf variant,
+/// or one that's always `notAllowed` for this event kind — which the caller
+/// handles itself.
+fn deriv_structural(
+    pattern: &Pattern,
+    group_sequential: bool,
+    definitions: &Definitions,
+    deriv_one: &dyn Fn(&Pattern) -> Pattern,
+) -> Option<Pattern> {
+    Some(match pattern {
+        Pattern::Group(values) => {
+            deriv_positions(values, group_sequential, group, definitions, deriv_one)
+        }
+        Pattern::Interleave(values) => {
+            deriv_positions(values, false, interleave, definitions, deriv_one)
+        }
+        Pattern::Choice(values) => deriv_choice(values, deriv_one),
+        Pattern::OneOrMore(values) => one_or_more_deriv(&values[0], pattern, deriv_one),
+        Pattern::Ref(name) => deriv_one(resolve_ref(name, definitions)),
+        _ => return None,
+    })
 }
 
 /// The derivative of `pattern` with respect to one *attribute* named
@@ -735,6 +765,10 @@ fn deriv_attribute(
     registry: &DatatypeRegistry,
     context: &DatatypeContext,
 ) -> Pattern {
+    let deriv_one = |v: &Pattern| deriv_attribute(v, name, value, definitions, registry, context);
+    if let Some(result) = deriv_structural(pattern, false, definitions, &deriv_one) {
+        return result;
+    }
     match pattern {
         Pattern::Attribute {
             name: name_class,
@@ -749,33 +783,6 @@ fn deriv_attribute(
                 Pattern::NotAllowed
             }
         }
-        Pattern::Group(values) => deriv_positions(values, false, group, definitions, &|v| {
-            deriv_attribute(v, name, value, definitions, registry, context)
-        }),
-        Pattern::Interleave(values) => {
-            deriv_positions(values, false, interleave, definitions, &|v| {
-                deriv_attribute(v, name, value, definitions, registry, context)
-            })
-        }
-        Pattern::Choice(values) => choice(
-            values
-                .iter()
-                .map(|v| deriv_attribute(v, name, value, definitions, registry, context))
-                .collect(),
-        ),
-        Pattern::OneOrMore(values) => one_or_more_deriv(&values[0], pattern, &|v| {
-            deriv_attribute(v, name, value, definitions, registry, context)
-        }),
-        Pattern::Ref(ref_name) => deriv_attribute(
-            definitions
-                .get(ref_name)
-                .expect("RELAX NG §4.18 guarantees every ref target exists"),
-            name,
-            value,
-            definitions,
-            registry,
-            context,
-        ),
         Pattern::Element { .. }
         | Pattern::Text
         | Pattern::Data { .. }
@@ -791,6 +798,11 @@ fn deriv_attribute(
         | Pattern::Grammar(_) => {
             unreachable!("resolved into other patterns by simplify_pattern")
         }
+        Pattern::Group(_)
+        | Pattern::Interleave(_)
+        | Pattern::Choice(_)
+        | Pattern::OneOrMore(_)
+        | Pattern::Ref(_) => unreachable!("handled by deriv_structural above"),
     }
 }
 
@@ -802,6 +814,10 @@ fn deriv_element_event(
     name: &ExpandedName,
     definitions: &Definitions,
 ) -> Pattern {
+    let deriv_one = |v: &Pattern| deriv_element_event(v, name, definitions);
+    if let Some(result) = deriv_structural(pattern, true, definitions, &deriv_one) {
+        return result;
+    }
     match pattern {
         Pattern::Element {
             name: name_class, ..
@@ -812,30 +828,6 @@ fn deriv_element_event(
                 Pattern::NotAllowed
             }
         }
-        Pattern::Group(values) => deriv_positions(values, true, group, definitions, &|v| {
-            deriv_element_event(v, name, definitions)
-        }),
-        Pattern::Interleave(values) => {
-            deriv_positions(values, false, interleave, definitions, &|v| {
-                deriv_element_event(v, name, definitions)
-            })
-        }
-        Pattern::Choice(values) => choice(
-            values
-                .iter()
-                .map(|v| deriv_element_event(v, name, definitions))
-                .collect(),
-        ),
-        Pattern::OneOrMore(values) => one_or_more_deriv(&values[0], pattern, &|v| {
-            deriv_element_event(v, name, definitions)
-        }),
-        Pattern::Ref(ref_name) => deriv_element_event(
-            definitions
-                .get(ref_name)
-                .expect("RELAX NG §4.18 guarantees every ref target exists"),
-            name,
-            definitions,
-        ),
         Pattern::Attribute { .. }
         | Pattern::Text
         | Pattern::Data { .. }
@@ -851,6 +843,11 @@ fn deriv_element_event(
         | Pattern::Grammar(_) => {
             unreachable!("resolved into other patterns by simplify_pattern")
         }
+        Pattern::Group(_)
+        | Pattern::Interleave(_)
+        | Pattern::Choice(_)
+        | Pattern::OneOrMore(_)
+        | Pattern::Ref(_) => unreachable!("handled by deriv_structural above"),
     }
 }
 
@@ -865,6 +862,10 @@ fn deriv_text(
     registry: &DatatypeRegistry,
     context: &DatatypeContext,
 ) -> Pattern {
+    let deriv_one = |v: &Pattern| deriv_text(v, text, definitions, registry, context);
+    if let Some(result) = deriv_structural(pattern, true, definitions, &deriv_one) {
+        return result;
+    }
     match pattern {
         // `text` absorbs any amount of text, including across separate
         // (non-adjacent, interleaved-with-elements) runs, so it stays
@@ -920,32 +921,6 @@ fn deriv_text(
                 Pattern::NotAllowed
             }
         }
-        Pattern::Group(values) => deriv_positions(values, true, group, definitions, &|v| {
-            deriv_text(v, text, definitions, registry, context)
-        }),
-        Pattern::Interleave(values) => {
-            deriv_positions(values, false, interleave, definitions, &|v| {
-                deriv_text(v, text, definitions, registry, context)
-            })
-        }
-        Pattern::Choice(values) => choice(
-            values
-                .iter()
-                .map(|v| deriv_text(v, text, definitions, registry, context))
-                .collect(),
-        ),
-        Pattern::OneOrMore(values) => one_or_more_deriv(&values[0], pattern, &|v| {
-            deriv_text(v, text, definitions, registry, context)
-        }),
-        Pattern::Ref(ref_name) => deriv_text(
-            definitions
-                .get(ref_name)
-                .expect("RELAX NG §4.18 guarantees every ref target exists"),
-            text,
-            definitions,
-            registry,
-            context,
-        ),
         Pattern::Element { .. }
         | Pattern::Attribute { .. }
         | Pattern::Empty
@@ -958,6 +933,11 @@ fn deriv_text(
         | Pattern::Grammar(_) => {
             unreachable!("resolved into other patterns by simplify_pattern")
         }
+        Pattern::Group(_)
+        | Pattern::Interleave(_)
+        | Pattern::Choice(_)
+        | Pattern::OneOrMore(_)
+        | Pattern::Ref(_) => unreachable!("handled by deriv_structural above"),
     }
 }
 
@@ -1049,13 +1029,9 @@ fn attribute_name_known(pattern: &Pattern, name: &ExpandedName, definitions: &De
             .iter()
             .any(|value| attribute_name_known(value, name, definitions)),
         Pattern::OneOrMore(values) => attribute_name_known(&values[0], name, definitions),
-        Pattern::Ref(ref_name) => attribute_name_known(
-            definitions
-                .get(ref_name)
-                .expect("RELAX NG §4.18 guarantees every ref target exists"),
-            name,
-            definitions,
-        ),
+        Pattern::Ref(ref_name) => {
+            attribute_name_known(resolve_ref(ref_name, definitions), name, definitions)
+        }
         _ => false,
     }
 }
@@ -1111,14 +1087,9 @@ fn collect_element_contents(
             }
         }
         Pattern::OneOrMore(values) => collect_element_contents(&values[0], name, definitions, out),
-        Pattern::Ref(ref_name) => collect_element_contents(
-            definitions
-                .get(ref_name)
-                .expect("RELAX NG §4.18 guarantees every ref target exists"),
-            name,
-            definitions,
-            out,
-        ),
+        Pattern::Ref(ref_name) => {
+            collect_element_contents(resolve_ref(ref_name, definitions), name, definitions, out)
+        }
         _ => {}
     }
 }

@@ -21,6 +21,7 @@ use std::cmp::Ordering;
 
 use regex::Regex;
 
+use super::collapse_whitespace;
 use super::registry::{DatatypeContext, DatatypeLibrary};
 
 pub(crate) struct XsdLibrary;
@@ -278,7 +279,7 @@ impl TypeKind {
                 is_hex_binary(value.trim()).then(|| Value::Text(normalize_case(value.trim())))
             }
             TypeKind::Binary(BinaryShape::Base64) => {
-                is_base64_binary(value.trim()).then(|| Value::Text(collapse_all_whitespace(value)))
+                is_base64_binary(value.trim()).then(|| Value::Text(collapse_whitespace(value)))
             }
             TypeKind::QNameLike => parse_qname(value.trim(), context).map(Value::QName),
         }
@@ -375,7 +376,7 @@ fn normalize_whitespace(value: &str, shape: StringShape) -> String {
     match shape {
         StringShape::Any => value.to_owned(),
         StringShape::Normalized => replace_whitespace(value),
-        _ => collapse_all_whitespace(value),
+        _ => collapse_whitespace(value),
     }
 }
 
@@ -390,10 +391,6 @@ fn replace_whitespace(value: &str) -> String {
             }
         })
         .collect()
-}
-
-fn collapse_all_whitespace(value: &str) -> String {
-    value.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn shape_is_satisfied(shape: StringShape, normalized: &str) -> bool {
@@ -420,13 +417,11 @@ fn is_name(value: &str) -> bool {
     chars.all(is_nmtoken_char)
 }
 
+/// XSD's `NCName` is the same production the syntax layer already
+/// approximates for RELAX NG's own `name`/`define`/... identifiers — reuse
+/// it rather than a second near-identical scanner.
 fn is_ncname(value: &str) -> bool {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(c) if (unicode_ident::is_xid_start(c) || c == '_') => {}
-        _ => return false,
-    }
-    chars.all(|c| unicode_ident::is_xid_continue(c) || matches!(c, '.' | '-' | '_'))
+    crate::syntax::is_valid_ncname(value)
 }
 
 fn is_language_tag(value: &str) -> bool {
@@ -468,11 +463,27 @@ struct Decimal {
     fraction_digits: String,
 }
 
+/// Splits off a leading `-` sign (`true` if present); an unsigned `value`
+/// (or one that only strips a leading `+`, which `Decimal::parse` handles
+/// itself) is returned unchanged with `false`.
+fn strip_negative(value: &str) -> (bool, &str) {
+    match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    }
+}
+
+fn is_ascii_digits(value: &str) -> bool {
+    value.chars().all(|c| c.is_ascii_digit())
+}
+
 impl Decimal {
     fn parse(value: &str) -> Option<Decimal> {
-        let (negative, rest) = match value.strip_prefix('-') {
-            Some(rest) => (true, rest),
-            None => (false, value.strip_prefix('+').unwrap_or(value)),
+        let (negative, rest) = strip_negative(value);
+        let rest = if negative {
+            rest
+        } else {
+            rest.strip_prefix('+').unwrap_or(rest)
         };
         let (integer_part, fraction_part) = match rest.split_once('.') {
             Some((int_part, frac_part)) => (int_part, frac_part),
@@ -481,9 +492,7 @@ impl Decimal {
         if integer_part.is_empty() && fraction_part.is_empty() {
             return None;
         }
-        if !integer_part.chars().all(|c| c.is_ascii_digit())
-            || !fraction_part.chars().all(|c| c.is_ascii_digit())
-        {
+        if !is_ascii_digits(integer_part) || !is_ascii_digits(fraction_part) {
             return None;
         }
         let integer_digits = integer_part.trim_start_matches('0');
@@ -606,10 +615,7 @@ struct Duration {
 
 impl Duration {
     fn parse(value: &str) -> Option<Duration> {
-        let (negative, rest) = match value.strip_prefix('-') {
-            Some(rest) => (true, rest),
-            None => (false, value),
-        };
+        let (negative, rest) = strip_negative(value);
         let rest = rest.strip_prefix('P')?;
         let (date_part, time_part) = match rest.split_once('T') {
             Some((date, time)) => (date, Some(time)),
@@ -846,11 +852,8 @@ fn parse_time_into(time: &str, temporal: &mut Temporal) -> Option<()> {
 }
 
 fn parse_year(value: &str) -> Option<i64> {
-    let (negative, digits) = match value.strip_prefix('-') {
-        Some(digits) => (true, digits),
-        None => (false, value),
-    };
-    if digits.len() < 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+    let (negative, digits) = strip_negative(value);
+    if digits.len() < 4 || !is_ascii_digits(digits) {
         return None;
     }
     let magnitude: i64 = digits.parse().ok()?;
@@ -858,7 +861,7 @@ fn parse_year(value: &str) -> Option<i64> {
 }
 
 fn parse_component(value: &str, min: u32, max: u32) -> Option<u32> {
-    if value.len() != 2 || !value.chars().all(|c| c.is_ascii_digit()) {
+    if value.len() != 2 || !is_ascii_digits(value) {
         return None;
     }
     let parsed: u32 = value.parse().ok()?;
@@ -878,7 +881,7 @@ fn normalize_case(value: &str) -> String {
 }
 
 fn is_base64_binary(value: &str) -> bool {
-    let collapsed = collapse_all_whitespace(value);
+    let collapsed = collapse_whitespace(value);
     let stripped: String = collapsed.chars().filter(|c| !c.is_whitespace()).collect();
     if stripped.is_empty() {
         return true;

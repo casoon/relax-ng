@@ -251,15 +251,23 @@ fn collect_ref_edges<'a>(pattern: &'a Pattern, edges: &mut Vec<&'a str>) {
     }
 }
 
-fn simplify_grammar(
-    grammar: &Grammar,
+/// Flattens `items` (resolving `include`/`div`, see [`flatten_items`]),
+/// splits them into `start`/`define` fragments (see [`collect_items`]), and
+/// merges each name's fragments into one pattern per §4.17 (see [`merge`]).
+/// Shared by the top-level grammar and by a nested `grammar` pattern (see
+/// `simplify_pattern`'s `Pattern::Grammar` case) — `missing_start` is the
+/// error for a grammar with no `start` fragment at all, worded for whichever
+/// of the two calls this is.
+fn resolve_grammar_items(
+    items: &[GrammarItem],
     resolver: &impl SchemaResolver,
     loading: &mut BTreeSet<String>,
-) -> Result<CompiledSchema, SchemaError> {
-    let items = flatten_items(&grammar.items, resolver, loading)?;
+    missing_start: &str,
+) -> Result<(Pattern, BTreeMap<String, Pattern>), SchemaError> {
+    let items = flatten_items(items, resolver, loading)?;
     let (starts, definitions) = collect_items(items)?;
-    let start = merge("start", starts)?.ok_or_else(|| SchemaError::new("grammar has no start"))?;
-    let definitions: BTreeMap<String, Pattern> = definitions
+    let start = merge("start", starts)?.ok_or_else(|| SchemaError::new(missing_start))?;
+    let definitions = definitions
         .into_iter()
         .map(|(name, fragments)| {
             let pattern = merge(&name, fragments)?
@@ -267,6 +275,16 @@ fn simplify_grammar(
             Ok((name, pattern))
         })
         .collect::<Result<_, SchemaError>>()?;
+    Ok((start, definitions))
+}
+
+fn simplify_grammar(
+    grammar: &Grammar,
+    resolver: &impl SchemaResolver,
+    loading: &mut BTreeSet<String>,
+) -> Result<CompiledSchema, SchemaError> {
+    let (start, definitions) =
+        resolve_grammar_items(&grammar.items, resolver, loading, "grammar has no start")?;
     // §4.19, checked here (pre-`notAllowed`-collapse) as well as again on
     // the fully-simplified form in `simplify_root` — this pass sees
     // `ref`s that §4.20 will later erase, but (unlike the raw form) can't
@@ -309,24 +327,22 @@ fn simplify_grammar(
     })
 }
 
+/// One `start`'s or `define`'s worth of same-named fragments, each still
+/// paired with its own `combine` — the raw material [`merge`] combines into
+/// a single pattern per §4.17.
+type Fragments = Vec<(Option<Combine>, Vec<Pattern>)>;
+
 /// Collects the `start` fragments and `define` fragments (keyed by name) out
 /// of an already-flattened item list, preserving each fragment's own
 /// `combine` separately — consistency between fragments (§4.17) is checked
 /// uniformly by `merge`, the single source of truth for that rule. Shared
 /// by the top-level grammar and by nested `grammar` patterns (see
 /// `simplify_pattern`'s `Pattern::Grammar` case).
-#[allow(clippy::type_complexity)]
 fn collect_items(
     items: Vec<GrammarItem>,
-) -> Result<
-    (
-        Vec<(Option<Combine>, Vec<Pattern>)>,
-        BTreeMap<String, Vec<(Option<Combine>, Vec<Pattern>)>>,
-    ),
-    SchemaError,
-> {
+) -> Result<(Fragments, BTreeMap<String, Fragments>), SchemaError> {
     let mut starts = Vec::new();
-    let mut definitions: BTreeMap<String, Vec<(Option<Combine>, Vec<Pattern>)>> = BTreeMap::new();
+    let mut definitions: BTreeMap<String, Fragments> = BTreeMap::new();
     for item in items {
         match item {
             GrammarItem::Start { combine, body } => starts.push((combine, body)),
@@ -540,14 +556,7 @@ fn simplify_pattern(
         }
         Pattern::Mixed(values) => interleave(vec![group(children(values)?), Pattern::Text]),
         Pattern::OneOrMore(values) => one_or_more(group(children(values)?)),
-        Pattern::List(values) => {
-            let body = group(children(values)?);
-            if matches!(body, Pattern::NotAllowed) {
-                Pattern::NotAllowed
-            } else {
-                Pattern::List(vec![body])
-            }
-        }
+        Pattern::List(values) => wrap_unless_not_allowed(group(children(values)?), Pattern::List),
         Pattern::Group(values) => group(children(values)?),
         Pattern::Choice(values) => choice(children(values)?),
         Pattern::Interleave(values) => interleave(children(values)?),
@@ -570,16 +579,11 @@ fn simplify_pattern(
         } => {
             check_name_class_constraints(name)?;
             check_attribute_name_class_constraints(name)?;
-            let body = group(children(body)?);
-            if matches!(body, Pattern::NotAllowed) {
-                Pattern::NotAllowed
-            } else {
-                Pattern::Attribute {
-                    name: name.clone(),
-                    body: vec![body],
-                    context: context.clone(),
-                }
-            }
+            wrap_unless_not_allowed(group(children(body)?), |body| Pattern::Attribute {
+                name: name.clone(),
+                body,
+                context: context.clone(),
+            })
         }
         Pattern::Data {
             datatype,
@@ -649,18 +653,12 @@ fn simplify_pattern(
             result?
         }
         Pattern::Grammar(nested) => {
-            let items = flatten_items(&nested.items, resolver, loading)?;
-            let (starts, raw_defines) = collect_items(items)?;
-            let start_body = merge("start", starts)?
-                .ok_or_else(|| SchemaError::new("nested grammar has no start"))?;
-            let raw_defines: BTreeMap<String, Pattern> = raw_defines
-                .into_iter()
-                .map(|(name, fragments)| {
-                    let pattern = merge(&name, fragments)?
-                        .ok_or_else(|| SchemaError::new(format!("`{name}` has no pattern")))?;
-                    Ok((name, pattern))
-                })
-                .collect::<Result<_, SchemaError>>()?;
+            let (start_body, raw_defines) = resolve_grammar_items(
+                &nested.items,
+                resolver,
+                loading,
+                "nested grammar has no start",
+            )?;
             let nested_scope: BTreeSet<String> = raw_defines.keys().cloned().collect();
 
             let simplified_start = simplify_pattern(
@@ -783,10 +781,15 @@ fn drop_identity_empty(mut values: Vec<Pattern>) -> Vec<Pattern> {
     values
 }
 
-/// Builds a (already-`Vec`-simplification-normalized) `group` — also used
-/// by the validator (Phase 05) to keep derivative-produced patterns
+/// Builds an already-`Vec`-simplification-normalized `group`/`interleave`:
+/// any `notAllowed` operand collapses the whole thing to `notAllowed`
+/// (`p,notAllowed ≡ notAllowed`, and likewise for `&`), then a leftover
+/// single operand (after dropping `empty` identities) stands in for the
+/// wrapper itself. Shared by [`group`]/[`interleave`], which only differ in
+/// which `Pattern` variant they wrap multiple leftover operands in — also
+/// used by the validator (Phase 05) to keep derivative-produced patterns
 /// canonical/small the same way simplification does.
-pub(crate) fn group(values: Vec<Pattern>) -> Pattern {
+fn collapse_sequence(values: Vec<Pattern>, wrap: fn(Vec<Pattern>) -> Pattern) -> Pattern {
     if values
         .iter()
         .any(|value| matches!(value, Pattern::NotAllowed))
@@ -799,8 +802,11 @@ pub(crate) fn group(values: Vec<Pattern>) -> Pattern {
     } else if values.len() == 1 {
         values.pop().expect("one")
     } else {
-        Pattern::Group(values)
+        wrap(values)
     }
+}
+pub(crate) fn group(values: Vec<Pattern>) -> Pattern {
+    collapse_sequence(values, Pattern::Group)
 }
 pub(crate) fn choice(mut values: Vec<Pattern>) -> Pattern {
     values.retain(|value| !matches!(value, Pattern::NotAllowed));
@@ -813,27 +819,22 @@ pub(crate) fn choice(mut values: Vec<Pattern>) -> Pattern {
     }
 }
 pub(crate) fn interleave(values: Vec<Pattern>) -> Pattern {
-    if values
-        .iter()
-        .any(|value| matches!(value, Pattern::NotAllowed))
-    {
-        return Pattern::NotAllowed;
-    }
-    let mut values = drop_identity_empty(values);
-    if values.is_empty() {
-        Pattern::Empty
-    } else if values.len() == 1 {
-        values.pop().expect("one")
-    } else {
-        Pattern::Interleave(values)
-    }
+    collapse_sequence(values, Pattern::Interleave)
 }
-pub(crate) fn one_or_more(body: Pattern) -> Pattern {
+/// `notAllowed` absorbs any wrapper built around it (`X(notAllowed) ≡
+/// notAllowed` for every single-body `X`) — otherwise wraps `body` in a
+/// one-element `Vec` via `wrap`. Shared by [`one_or_more`] and
+/// `simplify_pattern`'s `List`/`Attribute` cases.
+fn wrap_unless_not_allowed(body: Pattern, wrap: impl FnOnce(Vec<Pattern>) -> Pattern) -> Pattern {
     if matches!(body, Pattern::NotAllowed) {
         Pattern::NotAllowed
     } else {
-        Pattern::OneOrMore(vec![body])
+        wrap(vec![body])
     }
+}
+
+pub(crate) fn one_or_more(body: Pattern) -> Pattern {
+    wrap_unless_not_allowed(body, Pattern::OneOrMore)
 }
 
 /// Shared traversal state for [`check_restrictions`], bundled into one
@@ -920,7 +921,7 @@ fn check_restrictions(
                     "RELAX NG §7.3: an attribute with an anyName or nsName name class must have a oneOrMore ancestor",
                 ));
             }
-            for child in body {
+            body.iter().try_for_each(|child| {
                 check_restrictions(
                     child,
                     true,
@@ -928,8 +929,8 @@ fn check_restrictions(
                     in_one_or_more,
                     in_one_or_more_container,
                     scope,
-                )?;
-            }
+                )
+            })?;
         }
         Pattern::List(body) => {
             if in_list {
@@ -937,7 +938,7 @@ fn check_restrictions(
                     "RELAX NG §7.1.3: a list pattern cannot contain list",
                 ));
             }
-            for child in body {
+            body.iter().try_for_each(|child| {
                 check_restrictions(
                     child,
                     in_attribute,
@@ -945,8 +946,8 @@ fn check_restrictions(
                     in_one_or_more,
                     in_one_or_more_container,
                     scope,
-                )?;
-            }
+                )
+            })?;
         }
         Pattern::Interleave(values) if in_list => {
             return Err(SchemaError::new(
@@ -973,7 +974,7 @@ fn check_restrictions(
         // literal `oneOrMore` — real-world schemas commonly write `attr*`
         // rather than `(attr)+` for a repeatable wildcard attribute.
         Pattern::OneOrMore(values) | Pattern::ZeroOrMore(values) => {
-            for child in values {
+            values.iter().try_for_each(|child| {
                 check_restrictions(
                     child,
                     in_attribute,
@@ -981,12 +982,12 @@ fn check_restrictions(
                     true,
                     in_one_or_more_container,
                     scope,
-                )?;
-            }
+                )
+            })?;
         }
         Pattern::Group(values) | Pattern::Interleave(values) => {
             let in_container = in_one_or_more_container || in_one_or_more;
-            for child in values {
+            values.iter().try_for_each(|child| {
                 check_restrictions(
                     child,
                     in_attribute,
@@ -994,11 +995,11 @@ fn check_restrictions(
                     in_one_or_more,
                     in_container,
                     scope,
-                )?;
-            }
+                )
+            })?;
         }
         Pattern::Choice(values) | Pattern::Optional(values) | Pattern::Mixed(values) => {
-            for child in values {
+            values.iter().try_for_each(|child| {
                 check_restrictions(
                     child,
                     in_attribute,
@@ -1006,18 +1007,16 @@ fn check_restrictions(
                     in_one_or_more,
                     in_one_or_more_container,
                     scope,
-                )?;
-            }
+                )
+            })?;
         }
         Pattern::Element { body, .. } => {
-            for child in body {
-                check_restrictions(child, false, false, false, false, scope)?;
-            }
+            body.iter().try_for_each(|child| {
+                check_restrictions(child, false, false, false, false, scope)
+            })?;
         }
         Pattern::Data { except, .. } => {
-            for child in except {
-                check_except_restrictions(child)?;
-            }
+            except.iter().try_for_each(check_except_restrictions)?;
         }
         _ => {}
     }
@@ -1058,19 +1057,9 @@ fn check_builtin_datatype_constraints(
 /// `group`, `interleave`, `oneOrMore` or `empty`.
 fn check_except_restrictions(pattern: &Pattern) -> Result<(), SchemaError> {
     match pattern {
-        Pattern::Data { except, .. } => {
-            for child in except {
-                check_except_restrictions(child)?;
-            }
-            Ok(())
-        }
+        Pattern::Data { except, .. } => except.iter().try_for_each(check_except_restrictions),
         Pattern::Value { .. } => Ok(()),
-        Pattern::Choice(values) => {
-            for child in values {
-                check_except_restrictions(child)?;
-            }
-            Ok(())
-        }
+        Pattern::Choice(values) => values.iter().try_for_each(check_except_restrictions),
         _ => Err(SchemaError::new(
             "RELAX NG §7.1.4: a data/except pattern may only contain data, value or choice",
         )),
@@ -1088,12 +1077,9 @@ fn check_start_restrictions(
 ) -> Result<(), SchemaError> {
     match pattern {
         Pattern::Element { .. } | Pattern::NotAllowed => Ok(()),
-        Pattern::Choice(values) => {
-            for child in values {
-                check_start_restrictions(child, definitions, visiting)?;
-            }
-            Ok(())
-        }
+        Pattern::Choice(values) => values
+            .iter()
+            .try_for_each(|child| check_start_restrictions(child, definitions, visiting)),
         Pattern::Ref(name) => {
             if let Some(definition) = definitions.get(name)
                 && visiting.insert(name.clone())
@@ -1232,22 +1218,31 @@ fn check_attribute_name_class_constraints(class: &NameClass) -> Result<(), Schem
     }
 }
 
-fn name_class_contains_any(class: &NameClass) -> bool {
+/// Whether `class` (through any `except`/`choice` descendant) contains a
+/// name-class atom `is_target` accepts — shared by
+/// `name_class_contains_any`/`name_class_contains_namespace`, which only
+/// differ in which atom kind they're looking for.
+fn name_class_contains(class: &NameClass, is_target: fn(&NameClass) -> bool) -> bool {
+    if is_target(class) {
+        return true;
+    }
     match class {
-        NameClass::Any { .. } => true,
         NameClass::Name { .. } => false,
-        NameClass::Namespace { except, .. } => except.iter().any(name_class_contains_any),
-        NameClass::Choice(options) => options.iter().any(name_class_contains_any),
+        NameClass::Any { except, .. } | NameClass::Namespace { except, .. } => except
+            .iter()
+            .any(|item| name_class_contains(item, is_target)),
+        NameClass::Choice(options) => options
+            .iter()
+            .any(|item| name_class_contains(item, is_target)),
     }
 }
 
+fn name_class_contains_any(class: &NameClass) -> bool {
+    name_class_contains(class, |class| matches!(class, NameClass::Any { .. }))
+}
+
 fn name_class_contains_namespace(class: &NameClass) -> bool {
-    match class {
-        NameClass::Namespace { .. } => true,
-        NameClass::Name { .. } => false,
-        NameClass::Any { except, .. } => except.iter().any(name_class_contains_namespace),
-        NameClass::Choice(options) => options.iter().any(name_class_contains_namespace),
-    }
+    name_class_contains(class, |class| matches!(class, NameClass::Namespace { .. }))
 }
 
 /// True if `class` (through any `choice` branch) is an `anyName` or
@@ -1521,33 +1516,26 @@ fn check_group_restrictions(
     pattern: &Pattern,
     definitions: &BTreeMap<String, Pattern>,
 ) -> Result<(), SchemaError> {
+    let recurse = |values: &[Pattern]| -> Result<(), SchemaError> {
+        values
+            .iter()
+            .try_for_each(|child| check_group_restrictions(child, definitions))
+    };
     match pattern {
         Pattern::Group(values) => {
             check_pairwise(values, definitions, false)?;
-            for child in values {
-                check_group_restrictions(child, definitions)?;
-            }
+            recurse(values)?;
         }
         Pattern::Interleave(values) => {
             check_pairwise(values, definitions, true)?;
-            for child in values {
-                check_group_restrictions(child, definitions)?;
-            }
+            recurse(values)?;
         }
-        Pattern::Element { body, .. } | Pattern::Attribute { body, .. } => {
-            for child in body {
-                check_group_restrictions(child, definitions)?;
-            }
-        }
+        Pattern::Element { body, .. } | Pattern::Attribute { body, .. } => recurse(body)?,
         Pattern::Choice(values)
         | Pattern::Optional(values)
         | Pattern::ZeroOrMore(values)
         | Pattern::OneOrMore(values)
-        | Pattern::Mixed(values) => {
-            for child in values {
-                check_group_restrictions(child, definitions)?;
-            }
-        }
+        | Pattern::Mixed(values) => recurse(values)?,
         // `list` is excluded from §7.2 by spec note, and can't contain an
         // `attribute`, `ref` or `interleave` (§7.1.3) for §7.3/§7.4 to ever
         // find anything in — nothing to check inside it.

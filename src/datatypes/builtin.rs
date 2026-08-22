@@ -4,16 +4,10 @@
 //! `token`, neither taking any parameters (already enforced at schema-
 //! simplification time, see `simplify::check_builtin_datatype_constraints`).
 
+use super::collapse_whitespace;
 use super::registry::{DatatypeContext, DatatypeLibrary};
 
 pub(crate) struct BuiltinLibrary;
-
-/// §5.2: whitespace-collapse a `token` value — replace every whitespace
-/// character with a space, then collapse runs of spaces and trim. `string`
-/// does no processing at all; callers only call this for `token`.
-fn collapse_whitespace(value: &str) -> String {
-    value.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
-}
 
 impl DatatypeLibrary for BuiltinLibrary {
     fn validate_params(&self, type_name: &str, params: &[(&str, &str)]) -> Result<(), String> {

@@ -62,6 +62,23 @@ pub(crate) fn parse_with_inherited_ns(
     }
 }
 
+/// The bare `Context` a schema's syntax layer starts from, before any
+/// element's own attributes (`xml_context`/`CompactParser::declaration`)
+/// narrow it further.
+fn initial_context(
+    source: &SchemaSource,
+    datatype_library: Option<String>,
+    ns: Option<String>,
+) -> Context {
+    Context {
+        base_uri: source.base_uri().to_owned(),
+        namespaces: BTreeMap::new(),
+        default_namespace: None,
+        datatype_library,
+        ns,
+    }
+}
+
 fn parse_xml(
     source: &SchemaSource,
     inherited_ns: Option<String>,
@@ -74,18 +91,12 @@ fn parse_xml(
             "schema root must use the RELAX NG namespace",
         ));
     }
-    let root_context = Context {
-        base_uri: source.base_uri().to_owned(),
-        namespaces: BTreeMap::new(),
-        default_namespace: None,
-        // §4.3: the default when no ancestor sets `datatypeLibrary` is the
-        // empty string, not "unset" — the built-in datatype library.
-        datatype_library: Some(String::new()),
-        // §4.9: no ancestor to inherit `ns` from yet, other than what an
-        // externalRef/include passed in — the root element's own `ns` (if
-        // any) still wins over this, picked up by `xml_context` below.
-        ns: inherited_ns,
-    };
+    // §4.3: the default when no ancestor sets `datatypeLibrary` is the
+    // empty string, not "unset" — the built-in datatype library. §4.9: no
+    // ancestor to inherit `ns` from yet, other than what an
+    // externalRef/include passed in — the root element's own `ns` (if any)
+    // still wins over this, picked up by `xml_context` below.
+    let root_context = initial_context(source, Some(String::new()), inherited_ns);
     let context = xml_context(root, &root_context)?;
     let parsed = match root.tag_name().name() {
         "grammar" => Root::Grammar(xml_grammar(root, context)?),
@@ -251,9 +262,21 @@ fn token_attribute(node: Node<'_, '_>, name: &str) -> Option<String> {
     node.attribute(name).map(|value| value.trim().to_owned())
 }
 
+fn require_attribute_value(value: Option<String>, name: &str) -> Result<String, ParseError> {
+    value.ok_or_else(|| ParseError::new(format!("missing required `{name}` attribute")))
+}
+
 fn required_token_attribute(node: Node<'_, '_>, name: &str) -> Result<String, ParseError> {
-    token_attribute(node, name)
-        .ok_or_else(|| ParseError::new(format!("missing required `{name}` attribute")))
+    require_attribute_value(token_attribute(node, name), name)
+}
+
+/// The required `name` attribute, additionally checked to be a valid
+/// NCName under `label` — `ref`/`parentRef`/`define` all resolve their
+/// identifying name this way.
+fn required_ncname_attribute(node: Node<'_, '_>, label: &str) -> Result<String, ParseError> {
+    let name = required_token_attribute(node, "name")?;
+    require_ncname(&name, label)?;
+    Ok(name)
 }
 
 /// Approximates the XML Names `NCName` production (`(Letter|'_') (Letter |
@@ -263,7 +286,7 @@ fn required_token_attribute(node: Node<'_, '_>, name: &str) -> Result<String, Pa
 /// character tables — crucially, unlike `char::is_alphabetic`, XID_Start
 /// correctly excludes combining marks (e.g. Thai vowel signs), which are
 /// only valid as non-initial characters.
-fn is_valid_ncname(value: &str) -> bool {
+pub(crate) fn is_valid_ncname(value: &str) -> bool {
     let mut chars = value.chars();
     match chars.next() {
         Some(first) if unicode_ident::is_xid_start(first) || first == '_' => {}
@@ -287,6 +310,13 @@ fn require_ncname(value: &str, label: &str) -> Result<(), ParseError> {
 /// neither absent (unprefixed) *nor the RELAX NG namespace itself*: an
 /// attribute explicitly in the RNG namespace (however prefixed) is still
 /// RNG's own attribute set and must be checked against `allowed`.
+/// Builds a `ParseError` in the `` `<tag>` <message> `` shape every
+/// structural check below reports — `node`'s own tag name is filled in
+/// automatically.
+fn tag_error(node: Node<'_, '_>, message: impl fmt::Display) -> ParseError {
+    ParseError::new(format!("`<{}>` {message}", node.tag_name().name()))
+}
+
 fn reject_unknown_attributes(node: Node<'_, '_>, allowed: &[&str]) -> Result<(), ParseError> {
     for attr in node.attributes() {
         let name = attr.name();
@@ -294,30 +324,24 @@ fn reject_unknown_attributes(node: Node<'_, '_>, allowed: &[&str]) -> Result<(),
         if is_foreign || name == "ns" || name == "datatypeLibrary" || allowed.contains(&name) {
             continue;
         }
-        return Err(ParseError::new(format!(
-            "`<{}>` does not allow a `{name}` attribute",
-            node.tag_name().name()
-        )));
+        return Err(tag_error(
+            node,
+            format!("does not allow a `{name}` attribute"),
+        ));
     }
     Ok(())
 }
 
 fn require_at_least_one_child(node: Node<'_, '_>) -> Result<(), ParseError> {
     if rng_children(node).next().is_none() {
-        return Err(ParseError::new(format!(
-            "`<{}>` requires at least one child",
-            node.tag_name().name()
-        )));
+        return Err(tag_error(node, "requires at least one child"));
     }
     Ok(())
 }
 
 fn reject_children(node: Node<'_, '_>) -> Result<(), ParseError> {
     if rng_children(node).next().is_some() {
-        return Err(ParseError::new(format!(
-            "`<{}>` must not have children",
-            node.tag_name().name()
-        )));
+        return Err(tag_error(node, "must not have children"));
     }
     Ok(())
 }
@@ -329,25 +353,81 @@ fn reject_children(node: Node<'_, '_>) -> Result<(), ParseError> {
 /// elsewhere) is invalid here.
 fn reject_all_children(node: Node<'_, '_>) -> Result<(), ParseError> {
     if node.children().any(|child| child.is_element()) {
-        return Err(ParseError::new(format!(
-            "`<{}>` must not have child elements",
-            node.tag_name().name()
-        )));
+        return Err(tag_error(node, "must not have child elements"));
     }
     Ok(())
 }
 
-fn xml_patterns(node: Node<'_, '_>, context: &Context) -> Result<Vec<Pattern>, ParseError> {
-    rng_children(node)
+/// `reject_unknown_attributes` followed by `require_at_least_one_child` —
+/// the pairing every container element (`group`, `start`, `define`, an
+/// `except`'s own body, ...) starts with.
+fn require_children(node: Node<'_, '_>, allowed: &[&str]) -> Result<(), ParseError> {
+    reject_unknown_attributes(node, allowed)?;
+    require_at_least_one_child(node)
+}
+
+/// `reject_unknown_attributes` followed by `reject_children` — the pairing
+/// every childless leaf element (`empty`, `text`, `ref`, ...) starts with.
+fn require_no_children(node: Node<'_, '_>, allowed: &[&str]) -> Result<(), ParseError> {
+    reject_unknown_attributes(node, allowed)?;
+    reject_children(node)
+}
+
+/// `reject_unknown_attributes` followed by `reject_all_children` — for the
+/// plain-text elements (`name`, `value`, `param`).
+fn require_no_child_elements(node: Node<'_, '_>, allowed: &[&str]) -> Result<(), ParseError> {
+    reject_unknown_attributes(node, allowed)?;
+    reject_all_children(node)
+}
+
+fn xml_pattern_seq<'a, 'input: 'a>(
+    children: impl Iterator<Item = Node<'a, 'input>>,
+    context: &Context,
+) -> Result<Vec<Pattern>, ParseError> {
+    children
         .map(|child| xml_pattern(child, xml_context(child, context)?))
         .collect()
+}
+
+fn xml_patterns(node: Node<'_, '_>, context: &Context) -> Result<Vec<Pattern>, ParseError> {
+    xml_pattern_seq(rng_children(node), context)
+}
+
+/// Parses an `except` child (at most one is allowed, and it must itself
+/// have at least one child) shared by `data`'s and `anyName`/`nsName`'s
+/// name classes — `too_many` builds the error for a second `except`,
+/// `parse_child` parses each of its children (`xml_pattern` or
+/// `xml_name_class`, respectively).
+fn xml_except<'a, 'input: 'a, T>(
+    node: Node<'a, 'input>,
+    context: &Context,
+    too_many: impl FnOnce() -> ParseError,
+    parse_child: impl Fn(Node<'a, 'input>, Context) -> Result<T, ParseError>,
+) -> Result<Vec<T>, ParseError> {
+    let mut except_children =
+        rng_children(node).filter(|child| child.tag_name().name() == "except");
+    match (except_children.next(), except_children.next()) {
+        (None, _) => Ok(Vec::new()),
+        (Some(only), None) => {
+            require_children(only, &[])?;
+            rng_children(only)
+                .map(|child| parse_child(child, xml_context(child, context)?))
+                .collect()
+        }
+        (Some(_), Some(_)) => Err(too_many()),
+    }
+}
+
+/// §4.9: `value` and `nsName` both fall back to the inherited `ns` when
+/// they don't set their own.
+fn inherited_ns_attribute(node: Node<'_, '_>, context: &Context) -> Option<String> {
+    Some(token_attribute(node, "ns").unwrap_or_else(|| context.ns.clone().unwrap_or_default()))
 }
 
 fn xml_pattern(node: Node<'_, '_>, context: Context) -> Result<Pattern, ParseError> {
     let children = || xml_patterns(node, &context);
     let container = || -> Result<Vec<Pattern>, ParseError> {
-        reject_unknown_attributes(node, &[])?;
-        require_at_least_one_child(node)?;
+        require_children(node, &[])?;
         children()
     };
     match node.tag_name().name() {
@@ -376,37 +456,30 @@ fn xml_pattern(node: Node<'_, '_>, context: Context) -> Result<Pattern, ParseErr
         "list" => Ok(Pattern::List(container()?)),
         "mixed" => Ok(Pattern::Mixed(container()?)),
         "empty" => {
-            reject_unknown_attributes(node, &[])?;
-            reject_children(node)?;
+            require_no_children(node, &[])?;
             Ok(Pattern::Empty)
         }
         "notAllowed" => {
-            reject_unknown_attributes(node, &[])?;
-            reject_children(node)?;
+            require_no_children(node, &[])?;
             Ok(Pattern::NotAllowed)
         }
         "text" => {
-            reject_unknown_attributes(node, &[])?;
-            reject_children(node)?;
+            require_no_children(node, &[])?;
             Ok(Pattern::Text)
         }
         "ref" => {
-            reject_unknown_attributes(node, &["name"])?;
-            reject_children(node)?;
-            let name = required_token_attribute(node, "name")?;
-            require_ncname(&name, "ref name")?;
-            Ok(Pattern::Ref(name))
+            require_no_children(node, &["name"])?;
+            Ok(Pattern::Ref(required_ncname_attribute(node, "ref name")?))
         }
         "parentRef" => {
-            reject_unknown_attributes(node, &["name"])?;
-            reject_children(node)?;
-            let name = required_token_attribute(node, "name")?;
-            require_ncname(&name, "parentRef name")?;
-            Ok(Pattern::ParentRef(name))
+            require_no_children(node, &["name"])?;
+            Ok(Pattern::ParentRef(required_ncname_attribute(
+                node,
+                "parentRef name",
+            )?))
         }
         "externalRef" => {
-            reject_unknown_attributes(node, &["href"])?;
-            reject_children(node)?;
+            require_no_children(node, &["href"])?;
             Ok(Pattern::ExternalRef {
                 href: required_attribute(node, "href")?,
                 inherit_namespace: token_attribute(node, "ns"),
@@ -419,8 +492,7 @@ fn xml_pattern(node: Node<'_, '_>, context: Context) -> Result<Pattern, ParseErr
             let params = rng_children(node)
                 .filter(|child| child.tag_name().name() == "param")
                 .map(|child| {
-                    reject_unknown_attributes(child, &["name"])?;
-                    reject_all_children(child)?;
+                    require_no_child_elements(child, &["name"])?;
                     Ok(Param {
                         name: required_attribute(child, "name")?,
                         value: child.text().unwrap_or_default().to_owned(),
@@ -428,19 +500,12 @@ fn xml_pattern(node: Node<'_, '_>, context: Context) -> Result<Pattern, ParseErr
                     })
                 })
                 .collect::<Result<Vec<_>, ParseError>>()?;
-            let mut except_children =
-                rng_children(node).filter(|child| child.tag_name().name() == "except");
-            let except = match (except_children.next(), except_children.next()) {
-                (None, _) => Vec::new(),
-                (Some(only), None) => {
-                    reject_unknown_attributes(only, &[])?;
-                    require_at_least_one_child(only)?;
-                    xml_patterns(only, &context)?
-                }
-                (Some(_), Some(_)) => {
-                    return Err(ParseError::new("`<data>` may have at most one `except`"));
-                }
-            };
+            let except = xml_except(
+                node,
+                &context,
+                || ParseError::new("`<data>` may have at most one `except`"),
+                xml_pattern,
+            )?;
             Ok(Pattern::Data {
                 datatype: required_token_attribute(node, "type")?,
                 // §4.3: `context.datatype_library` already resolved this
@@ -452,8 +517,7 @@ fn xml_pattern(node: Node<'_, '_>, context: Context) -> Result<Pattern, ParseErr
             })
         }
         "value" => {
-            reject_unknown_attributes(node, &["type"])?;
-            reject_all_children(node)?;
+            require_no_child_elements(node, &["type"])?;
             let datatype = token_attribute(node, "type");
             // §4.4: a `value` with no `type` attribute defaults to `token`
             // in the *built-in* (empty-string) library, regardless of any
@@ -465,10 +529,7 @@ fn xml_pattern(node: Node<'_, '_>, context: Context) -> Result<Pattern, ParseErr
                 None
             };
             // §4.9: `value` inherits `ns` like `name`/`nsName` do.
-            let namespace = Some(
-                token_attribute(node, "ns")
-                    .unwrap_or_else(|| context.ns.clone().unwrap_or_default()),
-            );
+            let namespace = inherited_ns_attribute(node, &context);
             Ok(Pattern::Value {
                 value: node.text().unwrap_or_default().to_owned(),
                 datatype,
@@ -481,6 +542,19 @@ fn xml_pattern(node: Node<'_, '_>, context: Context) -> Result<Pattern, ParseErr
             "unsupported RELAX NG pattern `{name}`"
         ))),
     }
+}
+
+/// Looks `prefix` up in `namespaces`, or fails with `error_prefix` (e.g.
+/// `"unknown namespace prefix"`) followed by the prefix itself.
+fn resolve_namespace(
+    namespaces: &BTreeMap<String, String>,
+    prefix: &str,
+    error_prefix: &str,
+) -> Result<String, ParseError> {
+    namespaces
+        .get(prefix)
+        .cloned()
+        .ok_or_else(|| ParseError::new(format!("{error_prefix} `{prefix}`")))
 }
 
 /// §4.10 QNames: a `name`/shorthand `name=` value of the form `prefix:local`
@@ -500,10 +574,7 @@ fn resolve_name_lexical(
     }
     match lexical.split_once(':') {
         Some((prefix, local)) => {
-            let uri =
-                context.namespaces.get(prefix).cloned().ok_or_else(|| {
-                    ParseError::new(format!("unknown namespace prefix `{prefix}`"))
-                })?;
+            let uri = resolve_namespace(&context.namespaces, prefix, "unknown namespace prefix")?;
             Ok((local.to_owned(), Some(uri)))
         }
         None => Ok((lexical, Some(unqualified_default.unwrap_or_default()))),
@@ -573,17 +644,23 @@ fn xml_named_pattern(
         .next()
         .ok_or_else(|| ParseError::new("element or attribute requires a name class"))?;
     let name = xml_name_class(name, xml_context(name, context)?)?;
-    let body = children
-        .map(|child| xml_pattern(child, xml_context(child, context)?))
-        .collect::<Result<Vec<_>, _>>()?;
+    let body = xml_pattern_seq(children, context)?;
     Ok((name, finish_body(body)?))
+}
+
+fn xml_name_class_seq<'a, 'input: 'a>(
+    children: impl Iterator<Item = Node<'a, 'input>>,
+    context: &Context,
+) -> Result<Vec<NameClass>, ParseError> {
+    children
+        .map(|child| xml_name_class(child, xml_context(child, context)?))
+        .collect()
 }
 
 fn xml_name_class(node: Node<'_, '_>, context: Context) -> Result<NameClass, ParseError> {
     match node.tag_name().name() {
         "name" => {
-            reject_unknown_attributes(node, &[])?;
-            reject_all_children(node)?;
+            require_no_child_elements(node, &[])?;
             let raw = node.text().unwrap_or_default().trim().to_owned();
             let (lexical, namespace) = resolve_name_lexical(
                 raw,
@@ -605,32 +682,22 @@ fn xml_name_class(node: Node<'_, '_>, context: Context) -> Result<NameClass, Par
                 &[]
             };
             reject_unknown_attributes(node, allowed)?;
-            let mut except_children =
-                rng_children(node).filter(|child| child.tag_name().name() == "except");
-            let except = match (except_children.next(), except_children.next()) {
-                (None, _) => Vec::new(),
-                (Some(only), None) => {
-                    reject_unknown_attributes(only, &[])?;
-                    require_at_least_one_child(only)?;
-                    rng_children(only)
-                        .map(|nested| xml_name_class(nested, xml_context(nested, &context)?))
-                        .collect::<Result<Vec<_>, _>>()?
-                }
-                (Some(_), Some(_)) => {
-                    return Err(ParseError::new(format!(
+            let except = xml_except(
+                node,
+                &context,
+                || {
+                    ParseError::new(format!(
                         "`{}` may have at most one `except`",
                         node.tag_name().name()
-                    )));
-                }
-            };
+                    ))
+                },
+                xml_name_class,
+            )?;
             if node.tag_name().name() == "anyName" {
                 Ok(NameClass::Any { except, context })
             } else {
                 // §4.9: `nsName` inherits `ns` like `name`/`value` do.
-                let namespace = Some(
-                    token_attribute(node, "ns")
-                        .unwrap_or_else(|| context.ns.clone().unwrap_or_default()),
-                );
+                let namespace = inherited_ns_attribute(node, &context);
                 Ok(NameClass::Namespace {
                     namespace,
                     except,
@@ -639,13 +706,11 @@ fn xml_name_class(node: Node<'_, '_>, context: Context) -> Result<NameClass, Par
             }
         }
         "choice" => {
-            reject_unknown_attributes(node, &[])?;
-            require_at_least_one_child(node)?;
-            Ok(NameClass::Choice(
-                rng_children(node)
-                    .map(|child| xml_name_class(child, xml_context(child, &context)?))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+            require_children(node, &[])?;
+            Ok(NameClass::Choice(xml_name_class_seq(
+                rng_children(node),
+                &context,
+            )?))
         }
         name => Err(ParseError::new(format!(
             "unsupported RELAX NG name class `{name}`"
@@ -653,11 +718,18 @@ fn xml_name_class(node: Node<'_, '_>, context: Context) -> Result<NameClass, Par
     }
 }
 
+fn xml_grammar_item_seq<'a, 'input: 'a>(
+    children: impl Iterator<Item = Node<'a, 'input>>,
+    context: &Context,
+) -> Result<Vec<GrammarItem>, ParseError> {
+    children
+        .map(|child| xml_grammar_item(child, xml_context(child, context)?))
+        .collect()
+}
+
 fn xml_grammar(node: Node<'_, '_>, context: Context) -> Result<Grammar, ParseError> {
     reject_unknown_attributes(node, &[])?;
-    let items = rng_children(node)
-        .map(|child| xml_grammar_item(child, xml_context(child, &context)?))
-        .collect::<Result<Vec<_>, _>>()?;
+    let items = xml_grammar_item_seq(rng_children(node), &context)?;
     Ok(Grammar { context, items })
 }
 
@@ -676,8 +748,7 @@ fn implicit_group(body: Vec<Pattern>) -> Vec<Pattern> {
 fn xml_grammar_item(node: Node<'_, '_>, context: Context) -> Result<GrammarItem, ParseError> {
     match node.tag_name().name() {
         "start" => {
-            reject_unknown_attributes(node, &["combine"])?;
-            require_at_least_one_child(node)?;
+            require_children(node, &["combine"])?;
             let body = xml_patterns(node, &context)?;
             // §4.12 defines implicit grouping for `define`'s multiple
             // children, but not for `start`'s — unlike `define`, `start`
@@ -694,10 +765,8 @@ fn xml_grammar_item(node: Node<'_, '_>, context: Context) -> Result<GrammarItem,
             })
         }
         "define" => {
-            reject_unknown_attributes(node, &["name", "combine"])?;
-            require_at_least_one_child(node)?;
-            let name = required_token_attribute(node, "name")?;
-            require_ncname(&name, "define name")?;
+            require_children(node, &["name", "combine"])?;
+            let name = required_ncname_attribute(node, "define name")?;
             Ok(GrammarItem::Define {
                 name,
                 combine: xml_combine(node)?,
@@ -706,20 +775,17 @@ fn xml_grammar_item(node: Node<'_, '_>, context: Context) -> Result<GrammarItem,
         }
         "div" => {
             reject_unknown_attributes(node, &[])?;
-            Ok(GrammarItem::Div(
-                rng_children(node)
-                    .map(|child| xml_grammar_item(child, xml_context(child, &context)?))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+            Ok(GrammarItem::Div(xml_grammar_item_seq(
+                rng_children(node),
+                &context,
+            )?))
         }
         "include" => {
             reject_unknown_attributes(node, &["href"])?;
             Ok(GrammarItem::Include {
                 href: required_attribute(node, "href")?,
                 inherit_namespace: token_attribute(node, "ns"),
-                body: rng_children(node)
-                    .map(|child| xml_grammar_item(child, xml_context(child, &context)?))
-                    .collect::<Result<Vec<_>, _>>()?,
+                body: xml_grammar_item_seq(rng_children(node), &context)?,
                 context,
             })
         }
@@ -739,8 +805,7 @@ fn xml_combine(node: Node<'_, '_>) -> Result<Option<Combine>, ParseError> {
 }
 
 fn required_attribute(node: Node<'_, '_>, name: &str) -> Result<String, ParseError> {
-    attribute(node, name)
-        .ok_or_else(|| ParseError::new(format!("missing required `{name}` attribute")))
+    require_attribute_value(attribute(node, name), name)
 }
 
 struct CompactParser {
@@ -751,13 +816,7 @@ struct CompactParser {
 
 impl CompactParser {
     fn new(source: &SchemaSource) -> Self {
-        let mut context = Context {
-            base_uri: source.base_uri().to_owned(),
-            namespaces: BTreeMap::new(),
-            default_namespace: None,
-            datatype_library: None,
-            ns: None,
-        };
+        let mut context = initial_context(source, None, None);
         context
             .namespaces
             .insert("xml".into(), "http://www.w3.org/XML/1998/namespace".into());
@@ -848,9 +907,7 @@ impl CompactParser {
                 continue;
             }
             if self.peek_word("include") {
-                self.word("include")?;
-                let href = self.string()?;
-                let inherit_namespace = self.inherit_namespace()?;
+                let (href, inherit_namespace) = self.href_and_inherit_namespace("include")?;
                 let body = if self.peek_symbol('{') {
                     self.symbol('{')?;
                     let nested = self.grammar_contents(true)?;
@@ -900,41 +957,35 @@ impl CompactParser {
     fn pattern(&mut self) -> Result<Pattern, ParseError> {
         self.choice()
     }
-    fn choice(&mut self) -> Result<Pattern, ParseError> {
-        let mut values = vec![self.interleave()?];
-        while self.peek_symbol('|') {
-            self.symbol('|')?;
-            values.push(self.interleave()?);
+    /// Parses a left-associative `separator`-delimited sequence of
+    /// `parse_one`, collapsing a single value to itself and wrapping two or
+    /// more in `wrap` — shared by `choice`/`interleave`/`group` (over
+    /// `Pattern`) and `name_class` (over `NameClass`).
+    fn left_assoc<T>(
+        &mut self,
+        separator: char,
+        mut parse_one: impl FnMut(&mut Self) -> Result<T, ParseError>,
+        wrap: impl FnOnce(Vec<T>) -> T,
+    ) -> Result<T, ParseError> {
+        let mut values = vec![parse_one(self)?];
+        while self.peek_symbol(separator) {
+            self.symbol(separator)?;
+            values.push(parse_one(self)?);
         }
         Ok(if values.len() == 1 {
-            values.pop().unwrap()
+            values.pop().expect("one")
         } else {
-            Pattern::Choice(values)
+            wrap(values)
         })
+    }
+    fn choice(&mut self) -> Result<Pattern, ParseError> {
+        self.left_assoc('|', Self::interleave, Pattern::Choice)
     }
     fn interleave(&mut self) -> Result<Pattern, ParseError> {
-        let mut values = vec![self.group()?];
-        while self.peek_symbol('&') {
-            self.symbol('&')?;
-            values.push(self.group()?);
-        }
-        Ok(if values.len() == 1 {
-            values.pop().unwrap()
-        } else {
-            Pattern::Interleave(values)
-        })
+        self.left_assoc('&', Self::group, Pattern::Interleave)
     }
     fn group(&mut self) -> Result<Pattern, ParseError> {
-        let mut values = vec![self.postfix()?];
-        while self.peek_symbol(',') {
-            self.symbol(',')?;
-            values.push(self.postfix()?);
-        }
-        Ok(if values.len() == 1 {
-            values.pop().unwrap()
-        } else {
-            Pattern::Group(values)
-        })
+        self.left_assoc(',', Self::postfix, Pattern::Group)
     }
     fn postfix(&mut self) -> Result<Pattern, ParseError> {
         let mut pattern = self.primary()?;
@@ -1003,9 +1054,7 @@ impl CompactParser {
             return Ok(Pattern::Grammar(self.grammar()?));
         }
         if self.peek_word("external") {
-            self.word("external")?;
-            let href = self.string()?;
-            let inherit_namespace = self.inherit_namespace()?;
+            let (href, inherit_namespace) = self.href_and_inherit_namespace("external")?;
             return Ok(Pattern::ExternalRef {
                 href,
                 inherit_namespace,
@@ -1078,24 +1127,23 @@ impl CompactParser {
         }
         if name.contains(':') {
             let (datatype, datatype_library) = self.datatype_parts(name);
-            return Ok(Pattern::Data {
-                datatype,
-                datatype_library,
-                params: Vec::new(),
-                except: Vec::new(),
-                context: self.context.clone(),
-            });
+            return Ok(self.simple_data(datatype, datatype_library));
         }
         if name == "string" || name == "token" {
-            return Ok(Pattern::Data {
-                datatype: name,
-                datatype_library: Some(String::new()),
-                params: Vec::new(),
-                except: Vec::new(),
-                context: self.context.clone(),
-            });
+            return Ok(self.simple_data(name, Some(String::new())));
         }
         Ok(Pattern::Ref(name))
+    }
+    /// A `Pattern::Data` with no `param`/`except` children — the bare
+    /// `datatype`-name and `string`/`token`-literal forms.
+    fn simple_data(&self, datatype: String, datatype_library: Option<String>) -> Pattern {
+        Pattern::Data {
+            datatype,
+            datatype_library,
+            params: Vec::new(),
+            except: Vec::new(),
+            context: self.context.clone(),
+        }
     }
     /// `is_attribute` is only relevant to unprefixed plain names (not
     /// wildcards): per the Compact Syntax spec, `default namespace`
@@ -1104,16 +1152,11 @@ impl CompactParser {
     /// prefixed. It propagates into `except` name classes too, since
     /// those still denote possible attribute names in that position.
     fn name_class(&mut self, is_attribute: bool) -> Result<NameClass, ParseError> {
-        let mut choices = vec![self.name_class_atom(is_attribute)?];
-        while self.peek_symbol('|') {
-            self.symbol('|')?;
-            choices.push(self.name_class_atom(is_attribute)?);
-        }
-        Ok(if choices.len() == 1 {
-            choices.pop().unwrap()
-        } else {
-            NameClass::Choice(choices)
-        })
+        self.left_assoc(
+            '|',
+            |parser| parser.name_class_atom(is_attribute),
+            NameClass::Choice,
+        )
     }
     fn name_class_atom(&mut self, is_attribute: bool) -> Result<NameClass, ParseError> {
         let base = if self.peek_symbol('(') {
@@ -1172,11 +1215,7 @@ impl CompactParser {
     /// against the schema's `namespace`/`datatypes` declarations, or
     /// fails with a clear error if it was never declared.
     fn resolve_namespace_prefix(&self, prefix: &str) -> Result<String, ParseError> {
-        self.context
-            .namespaces
-            .get(prefix)
-            .cloned()
-            .ok_or_else(|| ParseError::new(format!("unknown namespace prefix `{prefix}`")))
+        resolve_namespace(&self.context.namespaces, prefix, "unknown namespace prefix")
     }
     /// Resolves a plain (non-wildcard) element/attribute name: `prefix:local`
     /// resolves `prefix` against the schema's `namespace` declarations
@@ -1210,14 +1249,24 @@ impl CompactParser {
         self.word("inherit")?;
         self.symbol('=')?;
         let prefix = self.identifier()?;
-        self.context
-            .namespaces
-            .get(&prefix)
-            .cloned()
-            .ok_or_else(|| {
-                ParseError::new(format!("unknown inherited namespace prefix `{prefix}`"))
-            })
-            .map(Some)
+        resolve_namespace(
+            &self.context.namespaces,
+            &prefix,
+            "unknown inherited namespace prefix",
+        )
+        .map(Some)
+    }
+    /// `word` followed by a string literal `href` and an optional `inherit
+    /// = prefix` — the pairing both `external`'s and `include`'s syntax
+    /// share.
+    fn href_and_inherit_namespace(
+        &mut self,
+        word: &str,
+    ) -> Result<(String, Option<String>), ParseError> {
+        self.word(word)?;
+        let href = self.string()?;
+        let inherit_namespace = self.inherit_namespace()?;
+        Ok((href, inherit_namespace))
     }
     fn datatype_parts(&self, name: String) -> (String, Option<String>) {
         match name.split_once(':') {
@@ -1262,39 +1311,55 @@ impl CompactParser {
     fn peek_symbol(&self, symbol: char) -> bool {
         matches!(self.peek(), Token::Symbol(value) if *value == symbol)
     }
-    fn word(&mut self, word: &str) -> Result<(), ParseError> {
-        if self.peek_word(word) {
+    /// Advances past the current token if `matched`, else fails with
+    /// `` expected `description` `` — shared by `word` and `symbol`.
+    fn expect(&mut self, matched: bool, description: impl fmt::Display) -> Result<(), ParseError> {
+        if matched {
             self.position += 1;
             Ok(())
         } else {
-            Err(ParseError::new(format!("expected `{word}`")))
+            Err(ParseError::new(format!("expected `{description}`")))
         }
     }
+    fn word(&mut self, word: &str) -> Result<(), ParseError> {
+        self.expect(self.peek_word(word), word)
+    }
     fn symbol(&mut self, symbol: char) -> Result<(), ParseError> {
-        if self.peek_symbol(symbol) {
-            self.position += 1;
-            Ok(())
-        } else {
-            Err(ParseError::new(format!("expected `{symbol}`")))
+        self.expect(self.peek_symbol(symbol), symbol)
+    }
+    /// Advances past and returns the current token's payload if `extract`
+    /// matches it, else fails with `` expected <description> `` — shared by
+    /// `identifier` and `string`.
+    fn expect_token(
+        &mut self,
+        extract: impl FnOnce(&Token) -> Option<String>,
+        description: &str,
+    ) -> Result<String, ParseError> {
+        match extract(self.peek()) {
+            Some(value) => {
+                self.position += 1;
+                Ok(value)
+            }
+            None => Err(ParseError::new(format!("expected {description}"))),
         }
     }
     fn identifier(&mut self) -> Result<String, ParseError> {
-        match self.peek().clone() {
-            Token::Word(value) => {
-                self.position += 1;
-                Ok(value)
-            }
-            _ => Err(ParseError::new("expected identifier")),
-        }
+        self.expect_token(
+            |token| match token {
+                Token::Word(value) => Some(value.clone()),
+                _ => None,
+            },
+            "identifier",
+        )
     }
     fn string(&mut self) -> Result<String, ParseError> {
-        match self.peek().clone() {
-            Token::String(value) => {
-                self.position += 1;
-                Ok(value)
-            }
-            _ => Err(ParseError::new("expected string literal")),
-        }
+        self.expect_token(
+            |token| match token {
+                Token::String(value) => Some(value.clone()),
+                _ => None,
+            },
+            "string literal",
+        )
     }
     fn end(&self) -> Result<(), ParseError> {
         if matches!(self.peek(), Token::End) {

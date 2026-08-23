@@ -385,9 +385,16 @@ fn flatten_items(
                     .map_err(|error| SchemaError::new(error.to_string()))
                     .and_then(|source| {
                         // §4.6/§4.7: this element's own `ns` transfers to
-                        // the referenced content as a fallback.
-                        parse_with_inherited_ns(&source, context.ns.clone())
-                            .map_err(|error| SchemaError::new(error.to_string()))
+                        // the referenced content as a fallback; likewise
+                        // (compact-syntax-specific, see
+                        // `parse_with_inherited_ns`'s doc comment) this
+                        // element's own compact-syntax `default namespace`.
+                        parse_with_inherited_ns(
+                            &source,
+                            context.ns.clone(),
+                            context.default_namespace.clone(),
+                        )
+                        .map_err(|error| SchemaError::new(error.to_string()))
                     })
                     .and_then(|included| {
                         let Root::Grammar(grammar) = included.root else {
@@ -631,9 +638,16 @@ fn simplify_pattern(
                 .map_err(|error| SchemaError::new(error.to_string()))
                 .and_then(|source| {
                     // §4.6: this element's own `ns` transfers to the
-                    // referenced content as a fallback.
-                    parse_with_inherited_ns(&source, context.ns.clone())
-                        .map_err(|error| SchemaError::new(error.to_string()))
+                    // referenced content as a fallback; likewise
+                    // (compact-syntax-specific, see
+                    // `parse_with_inherited_ns`'s doc comment) this
+                    // element's own compact-syntax `default namespace`.
+                    parse_with_inherited_ns(
+                        &source,
+                        context.ns.clone(),
+                        context.default_namespace.clone(),
+                    )
+                    .map_err(|error| SchemaError::new(error.to_string()))
                 })
                 .and_then(|resolved| match resolved.root {
                     Root::Pattern(value) => simplify_pattern(
@@ -1599,6 +1613,62 @@ mod tests {
         let compiled = simplify(&schema, &resolver).expect("schema simplifies");
         assert!(compiled.has_start());
         assert_eq!(compiled.definition_count(), 1);
+    }
+
+    /// Regression test: found via `html-conform`'s Phase 05d integration —
+    /// every real document was rejected with "unexpected element html"
+    /// against the vendored, multi-file HTML5 schema, even though its root
+    /// element's own `name()`/expanded-name matched exactly. Root cause:
+    /// `include`d compact-syntax files never inherited the includer's
+    /// `default namespace` declaration at all — `CompactParser::new`
+    /// silently dropped the value `parse_with_inherited_ns` was already
+    /// passing it (via a completely different field, `Context::ns`, which
+    /// `CompactParser` never even reads). An included file with no
+    /// `default namespace` of its own therefore always resolved its
+    /// unprefixed element names to *no* namespace, regardless of what the
+    /// includer declared — silently, no `SchemaError`/`ParseError`, only a
+    /// validator that unexpectedly rejects every document. This is the
+    /// normal, idiomatic way to structure a multi-file compact-syntax
+    /// schema (declare `default namespace` once in the entry module, don't
+    /// repeat it in every included one) — see `html-conform`'s vendored
+    /// `schema/html5/*.rnc`.
+    #[test]
+    fn default_namespace_inherits_across_include_into_a_file_that_declares_none() {
+        let resolver = Resolver(BTreeMap::from([(
+            "root.rnc".into(),
+            SchemaSource::new(
+                "root.elem = element root { empty }",
+                "memory:/root.rnc",
+                SchemaSyntax::Compact,
+            ),
+        )]));
+        let schema =
+            compact("default namespace = \"urn:example\"\ninclude \"root.rnc\"\nstart = root.elem");
+        let compiled = simplify(&schema, &resolver).expect("schema simplifies");
+
+        struct NamespacedRoot;
+        impl crate::Element for NamespacedRoot {
+            fn name(&self) -> crate::ExpandedName {
+                crate::ExpandedName {
+                    namespace: Some("urn:example".to_string()),
+                    local: "root".to_string(),
+                }
+            }
+            fn attributes(&self) -> impl Iterator<Item = (crate::ExpandedName, String)> {
+                std::iter::empty()
+            }
+            fn children(&self) -> impl Iterator<Item = crate::Content<Self>> {
+                std::iter::empty()
+            }
+        }
+
+        let registry = crate::DatatypeRegistry::new();
+        let errors = crate::validate(&compiled, &registry, &NamespacedRoot)
+            .expect("builtin-only registry needs no datatype support here");
+        assert!(
+            errors.is_empty(),
+            "expected the namespaced root element to validate cleanly, got {errors:?}"
+        );
     }
 
     #[test]

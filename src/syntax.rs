@@ -42,23 +42,40 @@ impl std::error::Error for ParseError {}
 /// restrictions; pass the result to [`crate::simplify`] for that (or use
 /// [`crate::Schema::compile`], which does both steps).
 pub fn parse(source: &SchemaSource) -> Result<SchemaDocument, ParseError> {
-    parse_with_inherited_ns(source, None)
+    parse_with_inherited_ns(source, None, None)
 }
 
 /// Like [`parse`], but for `externalRef`/`include`-referenced content
-/// specifically: §4.6/§4.7 have the referencing element's own (already
-/// §4.9-resolved) `ns` transfer to the referenced content's root as a
-/// fallback — used only if that root doesn't set its own `ns` — exactly
-/// as if the reference were replaced in-place by the referenced content.
-/// `datatypeLibrary` deliberately does *not* transfer this way (per spec),
-/// so this only ever affects `ns`.
+/// specifically — two independent, syntax-specific inheritance rules:
+///
+/// - `inherited_ns`: §4.6/§4.7 have the referencing element's own (already
+///   §4.9-resolved) `ns` transfer to the referenced content's root as a
+///   fallback — used only if that root doesn't set its own `ns` — exactly
+///   as if the reference were replaced in-place by the referenced content.
+///   `datatypeLibrary` deliberately does *not* transfer this way (per
+///   spec), so this only ever affects `ns`. XML-syntax-only in practice —
+///   [`CompactParser`] never reads `Context::ns`.
+/// - `inherited_default_namespace`: compact syntax's own `default
+///   namespace = "..."` declaration is a compact-syntax-only convenience
+///   (§ the compact-syntax spec's `default namespace` production; it has
+///   no direct XML-syntax equivalent — XML syntax uses `ns=`/`xmlns`
+///   attributes per element instead), so it needs its own, separate
+///   inheritance path across `include`/`externalRef` rather than reusing
+///   `inherited_ns`: a compact-syntax file that `include`s another
+///   compact-syntax file without repeating `default namespace` (the
+///   normal, idiomatic way to structure a multi-file compact-syntax
+///   schema — see the vendored `html-conform` HTML5 schema, where only
+///   the entry module declares it) must still resolve that included
+///   file's own unprefixed element names against the includer's declared
+///   default namespace, not silently against no namespace at all.
 pub(crate) fn parse_with_inherited_ns(
     source: &SchemaSource,
     inherited_ns: Option<String>,
+    inherited_default_namespace: Option<String>,
 ) -> Result<SchemaDocument, ParseError> {
     match source.syntax() {
         SchemaSyntax::Xml => parse_xml(source, inherited_ns),
-        SchemaSyntax::Compact => CompactParser::new(source).parse(),
+        SchemaSyntax::Compact => CompactParser::new(source, inherited_default_namespace).parse(),
     }
 }
 
@@ -815,8 +832,15 @@ struct CompactParser {
 }
 
 impl CompactParser {
-    fn new(source: &SchemaSource) -> Self {
+    /// `inherited_default_namespace`: seeds this file's starting `default
+    /// namespace` — the compact-syntax `include`/`externalRef` inheritance
+    /// fallback (see [`parse_with_inherited_ns`]'s doc comment). A `default
+    /// namespace = "..."` declaration later in *this* file's own text still
+    /// overrides it, same as any other declaration shadowing an inherited
+    /// default.
+    fn new(source: &SchemaSource, inherited_default_namespace: Option<String>) -> Self {
         let mut context = initial_context(source, None, None);
+        context.default_namespace = inherited_default_namespace;
         context
             .namespaces
             .insert("xml".into(), "http://www.w3.org/XML/1998/namespace".into());

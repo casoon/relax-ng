@@ -875,6 +875,7 @@ impl CompactParser {
             || self.peek_word("include")
             || self.peek_word("div")
             || self.looks_like_definition()
+            || self.looks_like_standalone_annotation()
         {
             Root::Grammar(self.grammar_contents(false)?)
         } else {
@@ -900,11 +901,24 @@ impl CompactParser {
         } else {
             self.word("default")?;
             self.word("namespace")?;
-            if matches!(self.peek(), Token::Word(_)) {
-                self.position += 1;
-            }
+            // `default namespace PREFIX = "URI"` (RNC §4.15) binds *both*
+            // the default namespace *and* `PREFIX` as an explicit,
+            // usable prefix for the same URI — not just a documentation
+            // convenience to discard. Without registering it, a later
+            // explicit `PREFIX:name` in the same file (MathML's
+            // `mathml3-common.rnc`: `default namespace m = "..."`, then
+            // `m:something` elsewhere) fails to resolve.
+            let prefix = if matches!(self.peek(), Token::Word(_)) {
+                Some(self.identifier()?)
+            } else {
+                None
+            };
             self.symbol('=')?;
-            self.context.default_namespace = Some(self.string()?);
+            let uri = self.string()?;
+            if let Some(prefix) = prefix {
+                self.context.namespaces.insert(prefix, uri.clone());
+            }
+            self.context.default_namespace = Some(uri);
         }
         Ok(())
     }
@@ -921,6 +935,11 @@ impl CompactParser {
             self.skip_annotations()?;
             if braces && self.peek_symbol('}') {
                 break;
+            }
+            if self.looks_like_standalone_annotation() {
+                self.position += 1; // the `prefix:local` word itself
+                self.skip_balanced_brackets()?;
+                continue;
             }
             if self.peek_word("div") {
                 self.word("div")?;
@@ -1034,6 +1053,14 @@ impl CompactParser {
         Ok(pattern)
     }
     fn primary(&mut self) -> Result<Pattern, ParseError> {
+        // A leading `[ ... ]` annotation (RNC Annex C.1, e.g. `[
+        // a:defaultValue = "..." ]` before an `attribute`/`element`
+        // particle inside a `,`-separated group) — the trailing-position
+        // counterpart is `postfix`'s own `skip_annotations()` call after
+        // parsing the suffixed pattern; that one only covers what follows
+        // *this* particle, not what precedes the *next* one in a group,
+        // which is why this is needed here too and not redundant with it.
+        self.skip_annotations()?;
         if self.peek_symbol('(') {
             self.symbol('(')?;
             let value = self.pattern()?;
@@ -1303,28 +1330,54 @@ impl CompactParser {
     }
     fn skip_annotations(&mut self) -> Result<(), ParseError> {
         while self.peek_symbol('[') {
-            let mut depth = 0usize;
-            loop {
-                match self.peek() {
-                    Token::Symbol('[') => {
-                        depth += 1;
-                        self.position += 1;
-                    }
-                    Token::Symbol(']') => {
-                        depth -= 1;
-                        self.position += 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    Token::End => {
-                        return Err(ParseError::new("unterminated compact syntax annotation"));
-                    }
-                    _ => self.position += 1,
+            self.skip_balanced_brackets()?;
+        }
+        Ok(())
+    }
+    /// Consumes a single `[ ... ]` group starting at the current position
+    /// (which must be the opening `[`), tracking nesting depth so an
+    /// annotation's own `[`/`]` (e.g. a nested annotation, or a literal
+    /// `[`/`]` inside a string token) doesn't end the skip early. Shared by
+    /// [`Self::skip_annotations`] (leading `[ ... ]` annotations before a
+    /// component) and [`Self::grammar_contents`] (a standalone *foreign
+    /// element annotation* like `a:documentation [ ... ]`, which — unlike
+    /// the leading-bracket form — is itself a whole annotation, not a
+    /// prefix attached to a following component).
+    fn skip_balanced_brackets(&mut self) -> Result<(), ParseError> {
+        let mut depth = 0usize;
+        loop {
+            match self.peek() {
+                Token::Symbol('[') => {
+                    depth += 1;
+                    self.position += 1;
                 }
+                Token::Symbol(']') => {
+                    depth -= 1;
+                    self.position += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Token::End => {
+                    return Err(ParseError::new("unterminated compact syntax annotation"));
+                }
+                _ => self.position += 1,
             }
         }
         Ok(())
+    }
+    /// Whether the current position is a *foreign element annotation*
+    /// used as its own standalone statement — `NCName ":" NCName "["
+    /// ... "]"` (RNC Annex C.2), e.g. `a:documentation [ "..." ]` — as
+    /// opposed to a `name = pattern`/`name |= pattern`/`name &= pattern`
+    /// definition. Distinguished by: the word contains a prefix colon
+    /// (`identifier()` alone can't tell a QName from a plain define name;
+    /// a bare define name is never colon-qualified in any of the vendored
+    /// schemas) *and* the following token is `[`, not an assignment
+    /// operator.
+    fn looks_like_standalone_annotation(&self) -> bool {
+        matches!(self.peek(), Token::Word(word) if word.contains(':'))
+            && matches!(self.tokens.get(self.position + 1), Some(Token::Symbol('[')))
     }
     fn peek(&self) -> &Token {
         self.tokens.get(self.position).unwrap_or(&Token::End)
@@ -1421,15 +1474,43 @@ fn lex(input: &str) -> Result<Vec<Token>, String> {
                     chars.next();
                 }
             }
-            '"' => {
+            // RNC string literals can be double- *or* single-quoted (Compact
+            // Syntax §2.2/Appendix grammar: `literal ::= literalSegment
+            // ('~' literalSegment)*`, `literalSegment ::= '"' ... '"' |
+            // "'" ... "'"`) — the vendored MathML schema's `length`
+            // datatype's regex `pattern` facet uses the single-quoted form
+            // specifically so the pattern's own literal `"` characters
+            // (none here, but backslashes/other RNC-special characters are
+            // common in regex facets) don't need escaping. Confirmed via
+            // `schema/mml3/mathml3-common.rnc`'s `length` definition,
+            // which previously tokenized as a run of stray `Word`/`Symbol`
+            // tokens instead of one `String`.
+            quote @ ('"' | '\'') => {
+                // RNC compact syntax has exactly one string escape —
+                // `\x{XXXX}` (Unicode code point), fully consumed by
+                // `decode_unicode_escapes` *before* this lexer ever runs
+                // (see that function's own doc comment/call site). A
+                // literal `\` reaching this loop is therefore never the
+                // start of some other escape sequence — it's ordinary
+                // string content and must be pushed through as-is.
+                // Getting this wrong (treating `\` as "drop the
+                // backslash, keep only the next character" — this loop's
+                // prior behavior) silently corrupts any string containing
+                // a raw backslash, e.g. an XSD regex `pattern` facet's
+                // `\s`/`\d`: confirmed against `schema/mml3/*.rnc`'s
+                // MathML datatype patterns, which use exactly that and
+                // previously came out as bare `s`/`d`, breaking the
+                // regex at `Schema::validate` time with a confusing
+                // "invalid pattern facet" error nowhere near the real
+                // cause. There is still no way to embed the *current*
+                // quote character inside a same-quoted string — write it
+                // in the other quote style instead (`"it's"` /
+                // `'she said "hi"'`), the same as every other language
+                // with both quote forms and no in-string escaping.
                 let mut value = String::new();
                 loop {
                     match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.next() {
-                            Some(next) => value.push(next),
-                            None => return Err("unterminated escape".into()),
-                        },
+                        Some(c) if c == quote => break,
                         Some(next) => value.push(next),
                         None => return Err("unterminated string literal".into()),
                     }
@@ -1448,7 +1529,7 @@ fn lex(input: &str) -> Result<Vec<Token>, String> {
                 // is the standalone `except` operator token — this matches
                 // the Compact Syntax spec's longest-match tokenization rule.
                 let mut value = String::from(character);
-                while matches!(chars.peek(), Some(next) if !next.is_whitespace() && !"{}()[],|&?*+=\"#".contains(*next))
+                while matches!(chars.peek(), Some(next) if !next.is_whitespace() && !"{}()[],|&?*+=\"'#".contains(*next))
                 {
                     value.push(chars.next().unwrap());
                 }
@@ -1569,6 +1650,101 @@ mod tests {
         .expect("Unicode escape parses");
     }
 
+    /// Regression for a bug found via `html-conform`'s SVG 1.1/MathML 3
+    /// schema vendoring: a *standalone* foreign element annotation (RNC
+    /// Annex C.2, e.g. MathML's own `a:documentation [ "..." ~ "..." ]`)
+    /// used as its own statement inside a `grammar { ... }` body —
+    /// distinct from the already-supported leading `[ ... ]` form before
+    /// a component.
+    #[test]
+    fn compact_parser_accepts_standalone_foreign_element_annotation_in_grammar_body() {
+        let document = parse(&source(
+            r#"namespace a = "urn:annotations"
+               grammar {
+                 a:documentation [ "doc" ~ "more" ]
+                 start = element foo { empty }
+               }"#,
+            SchemaSyntax::Compact,
+        ))
+        .expect("standalone foreign element annotation parses");
+        let Root::Grammar(grammar) = document.root else {
+            panic!("expected grammar")
+        };
+        // The annotation contributes no item — just the `start`.
+        assert_eq!(grammar.items.len(), 1);
+    }
+
+    /// Regression for the same class of bug: a leading `[ ... ]`
+    /// annotation directly on a pattern particle *inside* a `,`-group
+    /// (not just before a top-level component) — e.g. SVG's
+    /// `[ a:defaultValue = "..." ] attribute foo { text }?, attribute bar
+    /// { text }?`.
+    #[test]
+    fn compact_parser_accepts_leading_annotation_on_a_group_member() {
+        parse(&source(
+            r#"element foo {
+                 attribute a { text }?,
+                 [ a:defaultValue = "x" ]
+                 attribute b { text }?
+               }"#,
+            SchemaSyntax::Compact,
+        ))
+        .expect("leading annotation on a group member parses");
+    }
+
+    /// Regression: RNC allows single- *or* double-quoted string literals
+    /// (no in-string escaping needed for the other quote character —
+    /// write it in the other quote style instead). Confirmed via
+    /// `html-conform`'s vendored MathML `length` datatype's regex
+    /// `pattern` facet, which uses the single-quoted form.
+    #[test]
+    fn compact_parser_accepts_single_quoted_strings() {
+        let document = parse(&source(
+            r#"element foo { attribute a { 'she said "hi"' } }"#,
+            SchemaSyntax::Compact,
+        ))
+        .expect("single-quoted string containing literal double quotes parses");
+        let Root::Pattern(Pattern::Element { body, .. }) = document.root else {
+            panic!("expected element pattern")
+        };
+        let Pattern::Attribute {
+            body: attr_body, ..
+        } = &body[0]
+        else {
+            panic!("expected attribute pattern")
+        };
+        let Pattern::Value { value, .. } = &attr_body[0] else {
+            panic!("expected value pattern")
+        };
+        assert_eq!(value, r#"she said "hi""#);
+    }
+
+    /// Regression: RNC's only string escape is `\x{XXXX}` (fully consumed
+    /// by `decode_unicode_escapes` before this lexer ever runs) — any
+    /// other backslash reaching a string literal is ordinary content and
+    /// must survive verbatim, not have itself silently dropped.
+    #[test]
+    fn compact_parser_preserves_literal_backslashes_in_strings() {
+        let document = parse(&source(
+            r#"element foo { attribute pattern { "\s*\d+" } }"#,
+            SchemaSyntax::Compact,
+        ))
+        .expect("string with raw backslashes parses");
+        let Root::Pattern(Pattern::Element { body, .. }) = document.root else {
+            panic!("expected element pattern")
+        };
+        let Pattern::Attribute {
+            body: attr_body, ..
+        } = &body[0]
+        else {
+            panic!("expected attribute pattern")
+        };
+        let Pattern::Value { value, .. } = &attr_body[0] else {
+            panic!("expected value pattern")
+        };
+        assert_eq!(value, "\\s*\\d+");
+    }
+
     #[test]
     fn compact_parser_resolves_prefixed_element_and_attribute_names() {
         let document = parse(&source(
@@ -1633,6 +1809,28 @@ mod tests {
         // ...but never to unprefixed *attribute* names, which always get
         // no namespace regardless of any declared default.
         assert_eq!(namespace.as_deref(), Some(""));
+    }
+
+    /// Regression: `default namespace PREFIX = "URI"` (RNC §4.15) must
+    /// also register `PREFIX` as an explicit, usable prefix for the same
+    /// URI — not just set the default namespace and discard the prefix.
+    /// Found via `html-conform`'s vendored `mathml3-common.rnc`
+    /// (`default namespace m = "..."`, later `m:something`).
+    #[test]
+    fn compact_parser_registers_the_prefix_from_default_namespace_with_prefix() {
+        let document = parse(&source(
+            "default namespace m = \"urn:math\"\n\
+             element m:foo { empty }",
+            SchemaSyntax::Compact,
+        ))
+        .expect("explicit use of the default-namespace's own prefix parses");
+        let Root::Pattern(Pattern::Element { name, .. }) = document.root else {
+            panic!("expected an element pattern");
+        };
+        let NameClass::Name { namespace, .. } = &name else {
+            panic!("expected a plain name class");
+        };
+        assert_eq!(namespace.as_deref(), Some("urn:math"));
     }
 
     #[test]

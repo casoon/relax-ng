@@ -272,6 +272,8 @@ fn spec_test_suite_schema_classification() {
 struct RoxmlElement<'a, 'input>(Node<'a, 'input>);
 
 impl<'a, 'input> Element for RoxmlElement<'a, 'input> {
+    type Location = ();
+
     fn name(&self) -> ExpandedName {
         let tag = self.0.tag_name();
         ExpandedName::new(tag.namespace(), tag.name())

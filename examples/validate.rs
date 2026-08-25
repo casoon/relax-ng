@@ -72,6 +72,13 @@ impl Doc {
 }
 
 impl Element for Doc {
+    // `Doc` doesn't track positions, but the `Location` type still needs
+    // to be something a caller *could* print (`ValidationError<L>`'s
+    // `Display` impl requires `L: Display`) — a real caller with actual
+    // position data would use a small `{line, column}`-shaped struct
+    // here instead of a bare `String`.
+    type Location = String;
+
     fn name(&self) -> ExpandedName {
         ExpandedName::new(None::<String>, self.name)
     }

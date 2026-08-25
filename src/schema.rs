@@ -56,6 +56,8 @@ use crate::{
 ///     text: &'static str,
 /// }
 /// impl Element for Doc {
+///     type Location = ();
+///
 ///     fn name(&self) -> ExpandedName {
 ///         ExpandedName::new(None::<String>, self.name)
 ///     }
@@ -115,7 +117,7 @@ impl Schema {
         &self,
         registry: &DatatypeRegistry,
         root: &E,
-    ) -> Result<Vec<ValidationError>, DatatypeError> {
+    ) -> Result<Vec<ValidationError<E::Location>>, DatatypeError> {
         validate(&self.compiled, registry, root)
     }
 

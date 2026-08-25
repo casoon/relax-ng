@@ -1648,6 +1648,7 @@ mod tests {
 
         struct NamespacedRoot;
         impl crate::Element for NamespacedRoot {
+            type Location = ();
             fn name(&self) -> crate::ExpandedName {
                 crate::ExpandedName {
                     namespace: Some("urn:example".to_string()),

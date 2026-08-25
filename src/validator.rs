@@ -94,6 +94,15 @@ pub enum Content<E> {
 /// Implement this over whatever tree type the caller already has — no
 /// document is parsed by this crate itself.
 pub trait Element: Sized {
+    /// Whatever shape of location this implementation can report per
+    /// element — a formatted `String` (`"line:column"` or an XPath-like
+    /// pointer), a structured `{line, column, byte_offset}` struct the
+    /// caller defines, or `()` for callers with no location tracking at
+    /// all. Carried through unchanged into any [`ValidationError`] raised
+    /// against the element, so callers with real position data don't
+    /// have to re-parse a formatted string to get it back out — see
+    /// [`ValidationError::location`].
+    type Location;
     /// This element's expanded name.
     fn name(&self) -> ExpandedName;
     /// This element's attributes, in any order (attribute order is never
@@ -103,10 +112,9 @@ pub trait Element: Sized {
     fn attributes(&self) -> impl Iterator<Item = (ExpandedName, String)>;
     /// This element's children, in document order.
     fn children(&self) -> impl Iterator<Item = Content<Self>>;
-    /// An optional human-readable location (e.g. `line:column` or an
-    /// XPath-like pointer), included in any [`ValidationError`] raised
+    /// An optional location, included in any [`ValidationError`] raised
     /// against this element when available.
-    fn location(&self) -> Option<String> {
+    fn location(&self) -> Option<Self::Location> {
         None
     }
     /// The XML namespace prefix bindings in scope at this element
@@ -131,7 +139,7 @@ pub fn validate<E: Element>(
     schema: &CompiledSchema,
     registry: &DatatypeRegistry,
     root: &E,
-) -> Result<Vec<ValidationError>, DatatypeError> {
+) -> Result<Vec<ValidationError<E::Location>>, DatatypeError> {
     let mut checked_refs = BTreeSet::new();
     check_datatypes_supported(
         &schema.start,
@@ -166,14 +174,20 @@ pub fn validate<E: Element>(
 /// A single validation problem, with the path of element names from the
 /// document root down to (and including) the element it occurred on, and
 /// an optional location if [`Element::location`] provided one.
+///
+/// Generic over `L` (== the reporting [`Element`] implementation's own
+/// [`Element::Location`]) rather than hardcoding a formatted `String`, so
+/// a caller with real per-node position data (line/column/byte offset,
+/// or anything else) gets it back out structured, not as text to
+/// re-parse.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidationError {
+pub struct ValidationError<L> {
     kind: ValidationErrorKind,
     path: Vec<ExpandedName>,
-    location: Option<String>,
+    location: Option<L>,
 }
 
-impl ValidationError {
+impl<L> ValidationError<L> {
     /// What kind of problem this is.
     pub fn kind(&self) -> &ValidationErrorKind {
         &self.kind
@@ -185,12 +199,12 @@ impl ValidationError {
     }
     /// The location [`Element::location`] provided for the affected
     /// element, if any.
-    pub fn location(&self) -> Option<&str> {
-        self.location.as_deref()
+    pub fn location(&self) -> Option<&L> {
+        self.location.as_ref()
     }
 }
 
-impl fmt::Display for ValidationError {
+impl<L: fmt::Display> fmt::Display for ValidationError<L> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.kind)?;
         if let Some(location) = &self.location {
@@ -200,7 +214,7 @@ impl fmt::Display for ValidationError {
     }
 }
 
-impl std::error::Error for ValidationError {}
+impl<L: fmt::Debug + fmt::Display> std::error::Error for ValidationError<L> {}
 
 /// What kind of problem a [`ValidationError`] describes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -240,7 +254,7 @@ fn validate_element_content<E: Element>(
     definitions: &Definitions,
     registry: &DatatypeRegistry,
     path: &mut Vec<ExpandedName>,
-    errors: &mut Vec<ValidationError>,
+    errors: &mut Vec<ValidationError<E::Location>>,
 ) {
     path.push(element.name());
     let mut pattern = content.clone();
@@ -1134,12 +1148,29 @@ mod tests {
         DatatypeRegistry::new()
     }
 
+    /// A minimal, structured (not pre-formatted) location — exercises
+    /// [`Element::Location`] as something other than `String`/`()`, the
+    /// whole point of that associated type being generic rather than
+    /// hardcoded.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TestLocation {
+        line: u32,
+        column: u32,
+    }
+
+    impl fmt::Display for TestLocation {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "{}:{}", self.line, self.column)
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct TestElement {
         name: ExpandedName,
         attributes: Vec<(ExpandedName, String)>,
         children: Vec<Content<TestElement>>,
         namespace_bindings: Vec<(String, String)>,
+        location: Option<TestLocation>,
     }
 
     impl TestElement {
@@ -1149,6 +1180,7 @@ mod tests {
                 attributes: Vec::new(),
                 children: Vec::new(),
                 namespace_bindings: Vec::new(),
+                location: None,
             }
         }
 
@@ -1158,7 +1190,13 @@ mod tests {
                 attributes: Vec::new(),
                 children: Vec::new(),
                 namespace_bindings: Vec::new(),
+                location: None,
             }
+        }
+
+        fn at(mut self, line: u32, column: u32) -> Self {
+            self.location = Some(TestLocation { line, column });
+            self
         }
 
         fn attr(mut self, local: &str, value: &str) -> Self {
@@ -1185,6 +1223,7 @@ mod tests {
     }
 
     impl Element for TestElement {
+        type Location = TestLocation;
         fn name(&self) -> ExpandedName {
             self.name.clone()
         }
@@ -1194,12 +1233,15 @@ mod tests {
         fn children(&self) -> impl Iterator<Item = Content<Self>> {
             self.children.clone().into_iter()
         }
+        fn location(&self) -> Option<Self::Location> {
+            self.location.clone()
+        }
         fn namespace_bindings(&self) -> impl Iterator<Item = (String, String)> {
             self.namespace_bindings.clone().into_iter()
         }
     }
 
-    fn kinds(errors: &[ValidationError]) -> Vec<ValidationErrorKind> {
+    fn kinds(errors: &[ValidationError<TestLocation>]) -> Vec<ValidationErrorKind> {
         errors.iter().map(|error| error.kind().clone()).collect()
     }
 
@@ -1538,6 +1580,26 @@ mod tests {
             kinds(&errors),
             vec![ValidationErrorKind::UnexpectedAttribute(name("id"))]
         );
+    }
+
+    /// `Element::Location` is generic — a caller with real structured
+    /// position data (not just a pre-formatted string) gets it back out
+    /// of `ValidationError::location()` unchanged, not re-parsed from
+    /// text. `TestLocation` (`{line, column}`) stands in for whatever
+    /// shape a real caller's own position type has.
+    #[test]
+    fn structured_location_is_reported_on_the_validation_error() {
+        let compiled = schema("start = element foo { empty }");
+        let document = TestElement::new("foo").attr("id", "1").at(3, 7);
+        let errors = validate(&compiled, &registry(), &document).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].location(),
+            Some(&TestLocation { line: 3, column: 7 })
+        );
+        // `Display` still renders it as formatted text for messages that
+        // want that.
+        assert_eq!(errors[0].to_string(), "unexpected attribute `id` at 3:7");
     }
 
     #[test]

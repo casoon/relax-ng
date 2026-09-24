@@ -1,5 +1,17 @@
 # relax-ng
 
+> **Dieses Repository ist stillgelegt (24.09.2026).** Das Crate lebt weiter, aber
+> die Quelle ist jetzt das Monorepo
+> **[casoon/barrierlab](https://github.com/casoon/barrierlab)** — dort liegt es
+> unter `crates/relax-ng/`, mit der vollständigen Historie dieses Repositorys, neben
+> `html-conform`, das es benutzt.
+>
+> - **crates.io bleibt unverändert.** Was danach erscheint, kommt aus barrierlab.
+> - **Änderungen und Fehler** gehören dorthin. Hier wird nichts mehr gebaut.
+> - Doku: <https://casoon.github.io/barrierlab/>
+>
+> Der Text unten beschreibt den Stand bei der Stilllegung.
+
 A pure-Rust implementation of [RELAX NG](https://relaxng.org/) — reads a
 RELAX NG schema (compact `.rnc` or XML `.rng` syntax) and validates a
 document's structure against it: which elements/attributes are allowed
